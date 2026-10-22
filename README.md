@@ -29,10 +29,10 @@ FS25 ModYard runs natively on Linux and works with the Steam version of Farming 
    ```sh
    tar -xzf fs25-modyard-*.tar.gz
    cd fs25-modyard-*/
-   ./install.sh
+   ./install.sh --install-deps
    ```
 
-The installer needs **Python 3.10 or newer**, **GTK 3**, and **PyGObject**. It checks for these dependencies and, if missing, offers to install them through apt on Debian/Ubuntu, dnf on Fedora, pacman on Arch Linux, or zypper on openSUSE. Review the package list before accepting. To manage dependencies yourself, install the packages below and run `./install.sh --no-deps`.
+The installer checks for **Python 3.10 or newer**, **GTK 3**, and **PyGObject**. `--install-deps` installs missing packages through apt on Debian/Ubuntu, dnf on Fedora, pacman on Arch Linux, or zypper on openSUSE; it asks for your password through `sudo` when needed. Without that option, `./install.sh` asks before installing. Review the package list shown by the installer. To manage dependencies yourself, install the packages below and run `./install.sh --no-deps`.
 
 | Distribution family | Packages |
 | --- | --- |
