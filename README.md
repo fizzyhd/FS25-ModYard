@@ -34,6 +34,30 @@ FS25 ModYard runs natively on Linux and works with the Steam version of Farming 
 
 The installer checks for **Python 3.10 or newer**, **GTK 3**, and **PyGObject**. `--install-deps` installs missing packages through apt on Debian/Ubuntu, dnf on Fedora, pacman on Arch Linux, or zypper on openSUSE; it asks for your password through `sudo` when needed. Without that option, `./install.sh` asks before installing. Review the package list shown by the installer. To manage dependencies yourself, install the packages below and run `./install.sh --no-deps`.
 
+### Upgrade from an earlier version
+
+Close FS25 ModYard, download and extract the latest release bundle, then run the same installer from its extracted folder. It replaces the app files and launcher while keeping your mods, loadouts, collections, settings, and backups in `~/.local/share/fs25-modyard/`. You do not need to uninstall first. Do not use `uninstall.sh --purge-data` when upgrading; that removes your saved data.
+
+To download and install the latest release directly from a terminal, set `version` to the latest release number shown on the [Releases page](../../releases/latest) (currently `0.6.3`) and run:
+
+```bash
+set -euo pipefail
+version=0.6.3
+tmpdir="$(mktemp -d)"
+trap 'rm -rf -- "$tmpdir"' EXIT
+base="https://github.com/fizzyhd/FS25-ModYard/releases/latest/download"
+archive="fs25-modyard-${version}.tar.gz"
+
+curl -fL "$base/$archive" -o "$tmpdir/$archive"
+curl -fL "$base/$archive.sha256" -o "$tmpdir/$archive.sha256"
+(cd "$tmpdir" && sha256sum -c "$archive.sha256")
+tar -xzf "$tmpdir/$archive" -C "$tmpdir"
+cd "$tmpdir/fs25-modyard-$version"
+./install.sh --install-deps
+```
+
+The installer checks and installs missing system dependencies for supported distributions. It may ask for your `sudo` password; the app itself installs in your home directory.
+
 | Distribution family | Packages |
 | --- | --- |
 | Debian / Ubuntu | `python3 python3-gi gir1.2-gtk-3.0` |
