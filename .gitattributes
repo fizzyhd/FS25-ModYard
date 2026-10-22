@@ -1,0 +1,4 @@
+design/ export-ignore
+design-qa.md export-ignore
+verification-*.md export-ignore
+tests/ export-ignore

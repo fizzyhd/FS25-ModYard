@@ -1,0 +1,42 @@
+name: Build release downloads
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  source-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Build portable Linux source bundle
+        id: package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          python3 - "$version" <<'PY'
+          import sys
+          from farmsim_hub import __version__
+
+          if sys.argv[1] != __version__:
+              raise SystemExit(f"Release tag {sys.argv[1]} does not match app version {__version__}")
+          PY
+          archive="fs25-modyard-${version}.tar.gz"
+          git archive --format=tar.gz --prefix="fs25-modyard-${version}/" "refs/tags/${RELEASE_TAG}" > "$archive"
+          sha256sum "$archive" > "${archive}.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Attach bundle and checksum to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" "${{ steps.package.outputs.archive }}" "${{ steps.package.outputs.archive }}.sha256"
