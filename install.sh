@@ -24,17 +24,34 @@ case "${1:-}" in
 esac
 
 python_cmd="$(command -v python3 || true)"
-if [[ -z "$python_cmd" ]]; then
-    echo "Python 3 was not found. Install Python 3.10 or newer, then run this installer again." >&2
-    exit 1
+
+distro_id=""
+distro_like=""
+if [[ -r /etc/os-release ]]; then
+    # os-release is a shell-compatible file supplied by the operating system.
+    . /etc/os-release
+    distro_id="${ID:-}"
+    distro_like="${ID_LIKE:-}"
 fi
 
-if ! "$python_cmd" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-    echo "FS25 ModYard requires Python 3.10 or newer. Found: $($python_cmd --version 2>&1)" >&2
-    exit 1
+package_manager=""
+packages=()
+if command -v apt-get >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (debian|ubuntu|linuxmint|pop) ]]; then
+    package_manager="apt-get"
+    packages=(python3 python3-gi gir1.2-gtk-3.0)
+elif command -v dnf >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (fedora|rhel|centos) ]]; then
+    package_manager="dnf"
+    packages=(python3 python3-gobject gtk3)
+elif command -v pacman >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (arch|manjaro|endeavouros) ]]; then
+    package_manager="pacman"
+    packages=(python python-gobject gtk3)
+elif command -v zypper >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (opensuse|suse) ]]; then
+    package_manager="zypper"
+    packages=(python3 python3-gobject-Gdk gtk3)
 fi
 
 runtime_ok() {
+    [[ -n "$python_cmd" ]] || return 1
     "$python_cmd" - <<'PY'
 import gi
 gi.require_version("Gtk", "3.0")
@@ -44,35 +61,14 @@ from gi.repository import Gdk, GdkPixbuf, Gtk
 PY
 }
 
-if ! runtime_ok >/dev/null 2>&1; then
+python_version_ok() {
+    [[ -n "$python_cmd" ]] && "$python_cmd" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+}
+
+if [[ -z "$python_cmd" ]] || ! runtime_ok >/dev/null 2>&1; then
     if [[ "$mode" == "skip" ]]; then
-        echo "GTK 3 and PyGObject are missing. Install your distro's Python GTK 3 packages, then run ./install.sh again." >&2
+        echo "Python 3, GTK 3, or PyGObject is missing. Install your distro's packages, then run ./install.sh again." >&2
         exit 1
-    fi
-
-    distro_id=""
-    distro_like=""
-    if [[ -r /etc/os-release ]]; then
-        # os-release is a shell-compatible file supplied by the operating system.
-        . /etc/os-release
-        distro_id="${ID:-}"
-        distro_like="${ID_LIKE:-}"
-    fi
-
-    package_manager=""
-    packages=()
-    if command -v apt-get >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (debian|ubuntu|linuxmint|pop) ]]; then
-        package_manager="apt-get"
-        packages=(python3 python3-gi gir1.2-gtk-3.0)
-    elif command -v dnf >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (fedora|rhel|centos) ]]; then
-        package_manager="dnf"
-        packages=(python3 python3-gobject gtk3)
-    elif command -v pacman >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (arch|manjaro|endeavouros) ]]; then
-        package_manager="pacman"
-        packages=(python python-gobject gtk3)
-    elif command -v zypper >/dev/null 2>&1 && [[ "$distro_id $distro_like" =~ (opensuse|suse) ]]; then
-        package_manager="zypper"
-        packages=(python3 python3-gobject-Gdk gtk3)
     fi
 
     if [[ -z "$package_manager" ]]; then
@@ -112,6 +108,17 @@ if ! runtime_ok >/dev/null 2>&1; then
         pacman) "${sudo_cmd[@]}" pacman -S --needed --noconfirm "${packages[@]}" ;;
         zypper) "${sudo_cmd[@]}" zypper --non-interactive install "${packages[@]}" ;;
     esac
+    python_cmd="$(command -v python3 || true)"
+fi
+
+if [[ -z "$python_cmd" ]]; then
+    echo "Python 3 was not found after installing the distro packages." >&2
+    exit 1
+fi
+
+if ! python_version_ok; then
+    echo "FS25 ModYard requires Python 3.10 or newer. Found: $($python_cmd --version 2>&1)" >&2
+    exit 1
 fi
 
 if ! runtime_ok; then
