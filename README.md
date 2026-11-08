@@ -41,11 +41,11 @@ The installer checks for **Python 3.10 or newer**, **GTK 3**, and **PyGObject**.
 
 Close FS25 ModYard, download and extract the latest release bundle, then run the same installer from its extracted folder. It replaces the app files and launcher while keeping your mods, loadouts, collections, settings, and backups in `~/.local/share/fs25-modyard/`. You do not need to uninstall first. Do not use `uninstall.sh --purge-data` when upgrading; that removes your saved data.
 
-To download and install the latest release directly from a terminal, set `version` to the latest release number shown on the [Releases page](../../releases/latest) (currently `0.6.3`) and run:
+To download and install the latest release directly from a terminal, set `version` to the latest release number shown on the [Releases page](../../releases/latest) (currently `0.6.4`) and run:
 
 ```bash
 set -euo pipefail
-version=0.6.3
+version=0.6.4
 tmpdir="$(mktemp -d)"
 trap 'rm -rf -- "$tmpdir"' EXIT
 base="https://github.com/fizzyhd/FS25-ModYard/releases/latest/download"
