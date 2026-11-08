@@ -263,9 +263,10 @@ class Hub:
         self.config_path = self.data / "config.json"
         self.cache_path = self.data / "metadata-cache.json"
         self.lock = threading.RLock()
-        self.config = read_json(self.config_path, {"version": 1, "loadouts": [], "collections": [], "favorites": [], "mod_dirs": []})
-        for key in ["loadouts", "collections", "favorites", "mod_dirs"]:
+        self.config = read_json(self.config_path, {"version": 1, "loadouts": [], "collections": [], "favorites": [], "mod_dirs": [], "excluded_mod_dirs": []})
+        for key in ["loadouts", "collections", "favorites", "mod_dirs", "excluded_mod_dirs"]:
             self.config.setdefault(key, [])
+        self.config.setdefault("auto_check_updates", True)
         profiles = detect_profiles(self.home)
         self.profile = Path(self.config.get("profile", profiles[0] if profiles else ""))
         self._migrate_profile_mod_directory()
@@ -297,6 +298,85 @@ class Hub:
         with self.lock:
             write_json(self.config_path, self.config)
 
+    def main_mod_directory(self) -> Path:
+        """Return the selected FS25 profile's actual mod folder."""
+        return self.profile / "mods"
+
+    def active_applied_directory(self):
+        """Return ModYard's current loadout folder when it is still available."""
+        last_applied = self.config.get("last_applied") or {}
+        if last_applied.get("disabled"):
+            return None
+        return self.applied_download_directory()
+
+    def applied_download_directory(self):
+        """Return the latest applied folder for this profile, even if now disabled."""
+        applied_root = (self.data / "applied").resolve()
+        last_applied = self.config.get("last_applied") or {}
+        directory = last_applied.get("directory")
+        if not directory or last_applied.get("profile", str(self.profile)) != str(self.profile):
+            return None
+        path = Path(directory).expanduser().resolve()
+        try:
+            path.relative_to(applied_root)
+        except ValueError:
+            return None
+        return path if path.is_dir() else None
+
+    def move_applied_downloads(self, progress=None):
+        """Move new regular ZIPs from ModYard loadout folders into FS25's mod folder."""
+        require_game_closed()
+        self.check_profile()
+        folder = self.applied_download_directory()
+        if folder is None:
+            return {"moved": [], "skipped": []}
+        destination = self.main_mod_directory()
+        destination.mkdir(parents=True, exist_ok=True)
+        candidates = [path for path in sorted(folder.iterdir())
+                      if path.is_file() and not path.is_symlink() and path.suffix.lower() == ".zip"]
+        moved, skipped = [], []
+        for index, source in enumerate(candidates, 1):
+            if progress:
+                progress(f"Moving in-game mod {index} / {len(candidates)}: {source.name}")
+            target = destination / source.name
+            if target.exists():
+                skipped.append(f"{source.name}: a file with this name is already in the main mod folder; kept in the loadout folder")
+                continue
+            try:
+                before = source.stat()
+                stamp = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                with tempfile.TemporaryDirectory(prefix=".modyard-move-", dir=destination) as temp_dir:
+                    staged = Path(temp_dir) / source.name
+                    shutil.copy2(source, staged)
+                    info = mod_info(staged)
+                    if info["error"]:
+                        raise HubError(info["error"])
+                    with zipfile.ZipFile(staged) as archive:
+                        if archive.testzip():
+                            raise HubError("The ZIP failed its integrity check")
+                    after = source.stat()
+                    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != stamp:
+                        raise HubError("The downloaded file changed while it was being moved")
+                    require_game_closed()
+                    os.link(staged, target)
+                    try:
+                        require_game_closed()
+                        after = source.stat()
+                        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != stamp:
+                            raise HubError("The downloaded file changed during the move")
+                    except BaseException:
+                        target.unlink(missing_ok=True)
+                        raise
+                try:
+                    source.unlink()
+                except OSError as exc:
+                    skipped.append(f"{source.name}: copied to the main mod folder, but the loadout-folder copy could not be removed ({exc})")
+                else:
+                    moved.append(source.name)
+            except (HubError, OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+                skipped.append(f"{source.name}: {exc}")
+        return {"moved": moved, "skipped": skipped}
+
     def set_profile(self, profile: Path):
         profile = profile.expanduser().resolve()
         if not (profile / "gameSettings.xml").is_file():
@@ -306,16 +386,137 @@ class Hub:
         self.config["profile"] = str(profile)
         self.save_config()
 
+    @staticmethod
+    def _source_mod_names(directory: Path) -> set[str]:
+        try:
+            entries = directory.iterdir()
+            return {p.name for p in entries
+                    if (p.is_file() and p.suffix.lower() == ".zip")
+                    or (p.is_dir() and (p / "modDesc.xml").is_file())}
+        except OSError:
+            return set()
+
+    def mod_source_removal_impact(self, directory: Path) -> dict:
+        """Describe installed mods that would disappear if this source is excluded."""
+        source = Path(directory).expanduser().resolve()
+        if source == self.active_applied_directory():
+            raise HubError("The active loadout folder is scanned for in-game ModHub downloads and cannot be removed.")
+        directories = self.mod_directories()
+        if source not in directories:
+            raise HubError("This mod source is no longer active. Refresh Preferences and try again.")
+        names = self._source_mod_names(source)
+        elsewhere = set().union(*(self._source_mod_names(path) for path in directories if path != source))
+        unavailable = names - elsewhere
+        selected = {name for loadout in self.loadouts() for name in loadout.get("mods", [])}
+        return {"source": source, "mods": sorted(names), "unavailable": sorted(unavailable),
+                "selected_missing": sorted(unavailable & selected)}
+
+    def remove_mod_source(self, directory: Path):
+        """Stop scanning a source without changing files in that folder."""
+        source = Path(directory).expanduser().resolve()
+        if source == self.active_applied_directory():
+            raise HubError("The active loadout folder is scanned for in-game ModHub downloads and cannot be removed.")
+        if source not in self.mod_directories():
+            raise HubError("This mod source is no longer active. Refresh Preferences and try again.")
+        mod_dirs = [str(Path(value).expanduser().resolve()) for value in self.config["mod_dirs"]
+                    if Path(value).expanduser().resolve() != source]
+        excluded = {str(Path(value).expanduser().resolve()) for value in self.config["excluded_mod_dirs"]}
+        excluded.add(str(source))
+        self._commit_config(mod_dirs=mod_dirs, excluded_mod_dirs=sorted(excluded))
+
+    def add_mod_source(self, directory: Path):
+        """Add or re-enable a source folder selected by the user."""
+        source = Path(directory).expanduser().resolve()
+        if not source.is_dir():
+            raise HubError("Choose an existing mod folder.")
+        mod_dirs = list(dict.fromkeys(str(Path(value).expanduser().resolve()) for value in self.config["mod_dirs"]))
+        if str(source) not in mod_dirs:
+            mod_dirs.append(str(source))
+        excluded = {str(Path(value).expanduser().resolve()) for value in self.config["excluded_mod_dirs"]}
+        excluded.discard(str(source))
+        self._commit_config(mod_dirs=mod_dirs, excluded_mod_dirs=sorted(excluded))
+
     def mod_directories(self) -> list[Path]:
         dirs = [Path(x).expanduser() for x in self.config["mod_dirs"]]
-        dirs.extend([self.home / "Documents/FS25ModLibrary", self.data / "imports", self.profile / "mods"])
+        dirs.extend([self.main_mod_directory(), self.data / "imports", self.profile / "mods"])
+        active_applied = self.active_applied_directory()
+        if active_applied:
+            dirs.append(active_applied)
         old_profiles = self.home / "Documents/FS25ModProfiles"
         if old_profiles.is_dir():
             dirs.extend(x for x in old_profiles.iterdir() if x.is_dir())
         for loadout in self.config["loadouts"]:
             if loadout.get("extra_dir"):
                 dirs.append(Path(loadout["extra_dir"]))
-        return list(dict.fromkeys(p.resolve() for p in dirs if p.is_dir()))
+        excluded = {Path(x).expanduser().resolve() for x in self.config["excluded_mod_dirs"]}
+        return list(dict.fromkeys(path for path in (p.resolve() for p in dirs if p.is_dir()) if path not in excluded))
+
+    def mod_deletion_impact(self, names):
+        """List matching mod files and config references before permanent deletion."""
+        names = sorted(set(names))
+        if not names:
+            raise HubError("Select at least one mod.")
+        if any(not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name
+               for name in names):
+            raise HubError("A selected mod has an invalid filename.")
+        files = []
+        for directory in self.mod_directories():
+            for name in names:
+                path = directory / name
+                if path.is_symlink():
+                    if path.suffix.lower() == ".zip" or (path.is_dir() and (path / "modDesc.xml").is_file()):
+                        files.append(path)
+                elif path.is_file() and path.suffix.lower() == ".zip":
+                    files.append(path)
+                elif path.is_dir() and (path / "modDesc.xml").is_file():
+                    files.append(path)
+        loadouts = [loadout for loadout in self.config["loadouts"]
+                    if set(loadout.get("mods", [])) & set(names)]
+        collections = [collection for collection in self.config["collections"]
+                       if set(collection.get("mods", [])) & set(names)]
+        favorites = set(self.config["favorites"]) & set(names)
+        return {"names": names, "files": sorted(set(files), key=str), "loadouts": loadouts,
+                "collections": collections, "favorites": sorted(favorites)}
+
+    def delete_mods(self, names):
+        """Permanently delete selected mod files and remove their saved references."""
+        require_game_closed()
+        impact = self.mod_deletion_impact(names)
+        staged = []
+        stage_roots = {}
+        try:
+            for path in impact["files"]:
+                root = stage_roots.get(path.parent)
+                if root is None:
+                    root = path.parent / (".modyard-delete-" + uuid.uuid4().hex)
+                    root.mkdir()
+                    stage_roots[path.parent] = root
+                destination = root / path.name
+                os.replace(path, destination)
+                staged.append((path, destination))
+
+            names = set(impact["names"])
+            loadouts = [{**loadout, "mods": [name for name in loadout.get("mods", []) if name not in names]}
+                        for loadout in self.config["loadouts"]]
+            collections = [{**collection, "mods": [name for name in collection.get("mods", []) if name not in names]}
+                           for collection in self.config["collections"]]
+            favorites = [name for name in self.config["favorites"] if name not in names]
+            self._commit_config(loadouts=loadouts, collections=collections, favorites=favorites)
+        except BaseException:
+            for original, destination in reversed(staged):
+                if destination.exists() or destination.is_symlink():
+                    os.replace(destination, original)
+            for root in stage_roots.values():
+                root.rmdir()
+            raise
+
+        cleanup_pending = []
+        for root in stage_roots.values():
+            try:
+                shutil.rmtree(root)
+            except OSError:
+                cleanup_pending.append(str(root))
+        return {"names": impact["names"], "files": len(staged), "cleanup_pending": cleanup_pending}
 
     def scan(self, progress=None):
         from .categories import category_cache_valid
@@ -326,8 +527,11 @@ class Hub:
         files = []
         for directory in self.mod_directories():
             try:
+                active_applied = directory == self.active_applied_directory()
                 files.extend(p for p in sorted(directory.iterdir())
-                             if (p.suffix.lower() == ".zip" and p.is_file()) or (p.is_dir() and (p / "modDesc.xml").is_file()))
+                             if (not (active_applied and p.is_symlink()) and
+                                 ((p.suffix.lower() == ".zip" and p.is_file()) or
+                                  (p.is_dir() and (p / "modDesc.xml").is_file()))))
             except OSError as exc:
                 errors.append(str(exc))
         for i, path in enumerate(files):
@@ -497,8 +701,9 @@ class Hub:
             raise HubError("Start FS25 once, then rescan so its DLC versions can be read:\n" + "\n".join(sorted(unknown)))
 
     def dependency_closure(self, names):
-        selected, missing = set(names), set()
         by_stem = {Path(n).stem: n for n in self.mods}
+        selected = {name if name in self.mods else by_stem.get(Path(name).stem, name) for name in names}
+        missing = set()
         todo = list(selected)
         while todo:
             name = todo.pop()
@@ -616,6 +821,12 @@ class Hub:
                     continue
         raise HubError("No Proton drive maps to the loadout folder. Check the prefix's dosdevices links.")
 
+    def is_applied_windows_path(self, value):
+        """Return whether an FS25 Windows path points inside ModYard's applied folders."""
+        applied_root = self.windows_path(self.data / "applied").replace("\\", "/").rstrip("/").casefold()
+        candidate = str(value or "").replace("\\", "/").rstrip("/").casefold()
+        return candidate == applied_root or candidate.startswith(applied_root + "/")
+
     def _career_with_mods(self, save, names, progress=None, dlcs=None):
         root = read_xml((self.profile / f"savegame{save['slot']}/careerSavegame.xml").read_bytes())
         previous = {m.get("modName"): m for m in root.findall("mod")}
@@ -663,6 +874,9 @@ class Hub:
         old_settings = settings_path.read_bytes()
         settings_root = read_xml(old_settings)
         override = settings_root.find("modsDirectoryOverride")
+        previous_override = None if override is None else {
+            "attributes": dict(override.attrib), "text": override.text,
+        }
         if override is None:
             override = ET.SubElement(settings_root, "modsDirectoryOverride")
         override.set("active", "true")
@@ -698,8 +912,90 @@ class Hub:
         except BaseException:
             shutil.rmtree(applied)
             raise
-        self.config["last_applied"] = {"loadout": loadout["id"], "directory": str(applied), "backup": str(backup_path)}
+        self.config["last_applied"] = {"loadout": loadout["id"], "directory": str(applied),
+                                        "backup": str(backup_path),
+                                        "profile": str(self.profile),
+                                        "previous_mods_override": previous_override}
         self.save_config()
+        return backup_path
+
+    def disable_active_loadout(self):
+        """Restore the prior FS25 mod-folder override without changing a save."""
+        require_game_closed()
+        self.check_profile()
+        last_applied = self.config.get("last_applied") or {}
+        directory = last_applied.get("directory")
+        settings_path = self.profile / "gameSettings.xml"
+        old_settings = settings_path.read_bytes()
+        settings_root = read_xml(old_settings)
+        override = settings_root.find("modsDirectoryOverride")
+        if override is None or override.get("active", "false").lower() != "true":
+            return None
+        current_directory = override.get("directory", "")
+        if not self.is_applied_windows_path(current_directory):
+            return None
+
+        is_latest_applied = False
+        if directory and last_applied.get("profile", str(self.profile)) == str(self.profile):
+            try:
+                applied = Path(directory).expanduser().resolve()
+                applied.relative_to((self.data / "applied").resolve())
+                is_latest_applied = (current_directory.replace("\\", "/").rstrip("/").casefold() ==
+                                     self.windows_path(applied).replace("\\", "/").rstrip("/").casefold())
+            except (OSError, ValueError, HubError):
+                pass
+
+        previous = None
+        if is_latest_applied:
+            if "previous_mods_override" in last_applied:
+                previous = last_applied["previous_mods_override"]
+            else:
+                backup_path = Path(last_applied.get("backup", "")).expanduser().resolve()
+                try:
+                    backup_path.relative_to((self.data / "backups").resolve())
+                    with zipfile.ZipFile(backup_path) as archive:
+                        previous_root = read_xml(archive.read("gameSettings.xml"))
+                    previous_node = previous_root.find("modsDirectoryOverride")
+                    previous = None if previous_node is None else {
+                        "attributes": dict(previous_node.attrib), "text": previous_node.text,
+                    }
+                except (OSError, KeyError, ValueError, zipfile.BadZipFile, HubError) as exc:
+                    raise HubError("Could not recover the previous FS25 mod-folder setting from the apply backup. Nothing was changed.") from exc
+
+        if previous is not None and (not isinstance(previous, dict) or
+                                     not isinstance(previous.get("attributes", {}), dict)):
+            raise HubError("The saved FS25 mod-folder setting is invalid. Nothing was changed.")
+        if previous is not None and self.is_applied_windows_path(previous.get("attributes", {}).get("directory", "")):
+            # Older ModYard versions recorded the previous loadout as the prior
+            # setting. Deactivate that stale override so FS25 uses the profile's
+            # normal mods folder instead of an older ModYard snapshot.
+            override.set("active", "false")
+        elif is_latest_applied and previous is None:
+            settings_root.remove(override)
+        elif is_latest_applied and previous is not None:
+            override.attrib.clear()
+            override.attrib.update({str(k): str(v) for k, v in previous.get("attributes", {}).items()})
+            override.text = previous.get("text")
+        else:
+            # The setting points to another old ModYard folder. Its matching
+            # pre-loadout setting is no longer recorded, so deactivate it.
+            override.set("active", "false")
+
+        backup_path = self.backup(None, "Before disabling the ModYard loadout")
+        require_game_closed()
+        if settings_path.read_bytes() != old_settings:
+            raise HubError("FS25 settings changed while preparing. Nothing was changed.")
+        old_config = copy.deepcopy(last_applied)
+        try:
+            atomic_write(settings_path, xml_bytes(settings_root))
+            if last_applied:
+                last_applied["disabled"] = True
+                self.config["last_applied"] = last_applied
+                self.save_config()
+        except BaseException:
+            atomic_write(settings_path, old_settings)
+            self.config["last_applied"] = old_config
+            raise
         return backup_path
 
     def save_settings(self, slot: int, changes: dict):
@@ -766,6 +1062,54 @@ class Hub:
                 shutil.rmtree(stage)
         self.saves = list_saves(self.profile)
         self.seed_loadouts()
+
+    def delete_save(self, slot: int):
+        """Back up and remove one save slot, preserving its loadouts as independent setups."""
+        require_game_closed()
+        self.check_profile()
+        if not isinstance(slot, int) or not 1 <= slot <= 20:
+            raise HubError("Choose a valid save slot.")
+        profile = self.profile.resolve()
+        save_dir = profile / f"savegame{slot}"
+        if save_dir.is_symlink():
+            raise HubError("This save folder is a symbolic link. Remove it manually so ModYard does not delete files outside the FS25 folder.")
+        career_path = save_dir / "careerSavegame.xml"
+        if not save_dir.is_dir() or not career_path.is_file():
+            raise HubError("That save no longer exists. Rescan your saves and try again.")
+        original_career = career_path.read_bytes()
+        backup_path = self.backup(slot, f"Before deleting Save {slot}")
+        require_game_closed()
+        if not save_dir.is_dir() or save_dir.is_symlink() or not career_path.is_file() or career_path.read_bytes() != original_career:
+            raise HubError("The save changed while its backup was being created. Refresh and try again.")
+
+        staged = profile / f".modyard-deleted-save-{slot}-{uuid.uuid4().hex}"
+        os.replace(save_dir, staged)
+        source = f"{self.profile}/savegame{slot}"
+        loadouts = []
+        preserved_loadouts = 0
+        for loadout in self.config["loadouts"]:
+            item = dict(loadout)
+            if item.get("slot") == slot and item.get("profile", str(self.profile)) == str(self.profile):
+                item["slot"] = None
+                preserved_loadouts += 1
+                if item.get("source") == source:
+                    item.pop("source", None)
+            loadouts.append(item)
+        dismissed = [value for value in self.config.get("dismissed_loadout_sources", []) if value != source]
+        try:
+            self._commit_config(loadouts=loadouts, dismissed_loadout_sources=dismissed)
+        except BaseException:
+            os.replace(staged, save_dir)
+            raise
+
+        cleanup_pending = ""
+        try:
+            shutil.rmtree(staged)
+        except OSError:
+            cleanup_pending = str(staged)
+        self.saves = list_saves(self.profile)
+        return {"slot": slot, "backup": backup_path, "loadouts": preserved_loadouts,
+                "cleanup_pending": cleanup_pending}
 
     def restore(self, backup_path: Path):
         require_game_closed()
@@ -839,8 +1183,9 @@ class Hub:
         return recovery
 
     def import_mods(self, files: list[Path], progress=None):
-        dest = self.data / "imports"
-        dest.mkdir(exist_ok=True)
+        self.check_profile()
+        dest = self.main_mod_directory()
+        dest.mkdir(parents=True, exist_ok=True)
         imported, skipped = [], []
         for i, path in enumerate(files):
             if progress:

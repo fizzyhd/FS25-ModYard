@@ -296,6 +296,27 @@ def main():
         hub.scan()
         window.loaded()
         window.library.filter_to("All mods")
+        source_folder = Path(directory) / "extra-mod-source"
+        source_folder.mkdir()
+        source_mod = source_folder / "FS25_Interface_Source.zip"
+        make_mod(source_mod, title="Source removal UI")
+        hub.add_mod_source(source_folder)
+        hub.scan()
+        window.loaded()
+        window.go("Preferences")
+        window._refresh_preferences()
+        assert len(find_buttons(window.pages["Preferences"], "Remove")) == len(hub.mod_directories())
+        source_row = next(row for row in window.sources_list.get_children()
+                          if row.get_children()[0].get_text() == str(source_folder.resolve()))
+        remove_button = source_row.get_children()[1]
+        window.confirm = lambda *_: True
+        window.refresh = lambda: False
+        remove_button.clicked()
+        window._refresh_preferences()
+        assert source_mod.is_file(), "Removing a source must leave source files intact"
+        assert source_folder.resolve() not in hub.mod_directories()
+        assert all(row.get_children()[0].get_text() != str(source_folder.resolve())
+                   for row in window.sources_list.get_children())
         live_github = Path("/tmp/farmsim-hub-github-live.json")
         if live_github.is_file():
             window.modhub.cache = json.loads(live_github.read_text())
@@ -337,6 +358,7 @@ def main():
                           "search_filters_sort_favourites_loadouts_collections": "passed",
                           "delete_cancel_delete_last_loadout_export_dlc_update_controls": "passed",
                           "modhub_search_button_and_download_into_library": "passed",
+                          "remove_mod_source_control_and_file_preservation": "passed",
                           "category_badges_search_and_telehandler_filter": "passed",
                           "collection_add_remove_search_edit_cancel_and_persistence": "passed",
                           "viewports": [2048, 1360, 1180], "renders": str(output)}, indent=2))

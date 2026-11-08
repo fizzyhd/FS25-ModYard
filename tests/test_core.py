@@ -82,6 +82,55 @@ class CoreTests(unittest.TestCase):
         for path, content in before.items():
             self.assertEqual(path.read_bytes(), content)
 
+    def test_removing_unique_source_keeps_files_and_marks_selected_mod_missing(self):
+        source = self.home / "Downloads/Extra FS25 Mods"
+        source.mkdir(parents=True)
+        mod = source / "FS25_OnlyHere.zip"
+        make_mod(mod, "Only here")
+        original = mod.read_bytes()
+        self.hub.add_mod_source(source)
+        self.hub.scan()
+        self.hub.set_selection(self.loadout, [mod.name])
+
+        impact = self.hub.mod_source_removal_impact(source)
+        self.assertEqual(impact["unavailable"], [mod.name])
+        self.assertEqual(impact["selected_missing"], [mod.name])
+
+        self.hub.remove_mod_source(source)
+        self.hub.scan()
+        self.assertNotIn(source.resolve(), self.hub.mod_directories())
+        self.assertNotIn(mod.name, self.hub.mods)
+        self.assertIn(mod.name, self.loadout["mods"])
+        self.assertEqual(mod.read_bytes(), original)
+        with self.assertRaisesRegex(HubError, mod.name):
+            self.hub.validate_loadout(self.loadout)
+
+        reopened = Hub(home=self.home, data_dir=self.hub.data)
+        reopened.scan()
+        self.assertNotIn(source.resolve(), reopened.mod_directories())
+        self.assertNotIn(mod.name, reopened.mods)
+        reopened.add_mod_source(source)
+        reopened.scan()
+        self.assertIn(mod.name, reopened.mods)
+
+    def test_removing_automatic_source_keeps_duplicate_mods_and_persists_exclusion(self):
+        source = self.library
+        originals = {p.name: p.read_bytes() for p in source.glob("*.zip")}
+        impact = self.hub.mod_source_removal_impact(source)
+        self.assertEqual(impact["unavailable"], [])
+        self.assertEqual(impact["selected_missing"], [])
+
+        self.hub.remove_mod_source(source)
+        self.hub.scan()
+        self.assertNotIn(source.resolve(), self.hub.mod_directories())
+        self.assertTrue(set(originals) <= set(self.hub.mods))
+        self.assertEqual({p.name: p.read_bytes() for p in source.glob("*.zip")}, originals)
+
+        reopened = Hub(home=self.home, data_dir=self.hub.data)
+        self.assertNotIn(source.resolve(), reopened.mod_directories())
+        reopened.scan()
+        self.assertTrue(set(originals) <= set(reopened.mods))
+
     def test_metadata_cache_from_previous_version_is_upgraded_with_icon_field(self):
         cache = json.loads(self.hub.cache_path.read_text())
         for item in cache.values():

@@ -205,6 +205,10 @@ class LibraryBrowser(Gtk.Box):
         self.launch_button = launch
         launch.set_valign(Gtk.Align.END)
         controls.pack_start(launch, False, False, 0)
+        launch_all = action("Launch FS25 normally", owner.launch_all_mods, "media-playback-start-symbolic")
+        launch_all.set_tooltip_text("Apply every installed mod to the selected save, then launch FS25")
+        self.launch_all_button = launch_all
+        controls.pack_start(launch_all, False, False, 0)
         self.hero_row.add(controls)
         self.hero.add(self.hero_row)
         self.pack_start(self.hero, False, False, 0)
@@ -271,13 +275,18 @@ class LibraryBrowser(Gtk.Box):
                                       ("Clear shown", lambda: owner.select_shown(False)),
                                       ("New loadout", owner.create_loadout),
                                       ("Export current loadout", owner.export_loadout),
+                                      ("Find and install missing dependencies", owner.find_missing_dependencies),
+                                      ("Launch FS25 normally", owner.launch_all_mods),
                                       ("Check ModHub updates", lambda: owner.check_mod_updates(True)),
                                       ("Make collection", owner.create_collection),
                                       ("Add to collection…", owner.add_to_collection),
-                                      ("Import ZIP mods", owner.import_files)]:
+                                      ("Delete highlighted mods and files…", owner.delete_mods),
+                                      ("Import or update ZIP mods", owner.import_files)]:
             item = Gtk.MenuItem(label=title_text)
             item.connect("activate", lambda *_, cb=callback: cb())
             menu.append(item)
+            if title_text == "Find and install missing dependencies":
+                self.dependencies_item = item
         menu.show_all()
         filters.pack_start(tools, False, False, 0)
         self.tools = tools
@@ -291,6 +300,10 @@ class LibraryBrowser(Gtk.Box):
         self.remove_collection = action("Remove from collection", owner.remove_from_collection, "list-remove-symbolic")
         self.remove_collection.set_tooltip_text("Remove highlighted cards from this collection; keep their mod files and loadouts")
         membership.pack_start(self.remove_collection, False, False, 0)
+        self.delete_mods = action("Delete highlighted mods and files…", owner.delete_mods, "edit-delete-symbolic")
+        self.delete_mods.set_tooltip_text("Permanently delete highlighted mod files and remove their saved references")
+        self.delete_mods.get_style_context().add_class("destructive-action")
+        membership.pack_start(self.delete_mods, False, False, 0)
         self.membership_hint = text("Highlight cards to add them to a collection.", "muted")
         self.membership_hint.set_ellipsize(Pango.EllipsizeMode.END)
         membership.pack_start(self.membership_hint, True, True, 0)
@@ -411,6 +424,7 @@ class LibraryBrowser(Gtk.Box):
         for widget in [self.edit_collection, self.remove_collection]:
             widget.set_visible(self.collection_filter is not None)
         self.remove_collection.set_sensitive(highlighted)
+        self.delete_mods.set_sensitive(highlighted)
         self.membership_hint.set_text("Highlight cards to remove them from this collection." if self.collection_filter
                                       else "Highlight cards to add them to a collection.")
 

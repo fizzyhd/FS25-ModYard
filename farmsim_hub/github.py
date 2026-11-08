@@ -198,7 +198,7 @@ class GitHubClient:
             tag = release["tag_name"].removeprefix("v").removeprefix("V")
             info["version"] = tag if version_number(tag) is not None else info.get("version", "")
             packaged = False
-        if not same_identity(mod, info, trusted):
+        if not mod.get("trusted_dependency") and not same_identity(mod, info, trusted):
             raise GitHubError("The GitHub release's mod title or author does not match the installed mod.")
         return {**base, **info, "filename": asset["name"], "download_url": download,
                 "url": release.get("html_url", base["url"]), "release_tag": release["tag_name"],

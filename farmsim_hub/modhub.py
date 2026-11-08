@@ -248,7 +248,11 @@ class ModHubClient:
             raise HubError("Choose a supported ModHub category.")
         if category:
             parameters["filter"] = category
-        if query.strip() and inferred != category:
+        # With "All categories" selected, GTK may report no active category
+        # (None). For queries that do not map to a known ModHub category,
+        # that also makes inferred == category. Still send the text search;
+        # otherwise ModHub silently falls back to its latest-mods listing.
+        if query.strip() and (not inferred or inferred != category):
             parameters["searchMod"] = query.strip()[:200]
         elif not category:
             parameters["filter"] = "latest"
@@ -260,6 +264,8 @@ class ModHubClient:
 
         def picture(item):
             fallback = next((label for label, key in MODHUB_CATEGORIES.items() if key == category), "ModHub mod")
+            if category == "gameplay":
+                fallback = "Gameplay"
             item["category"] = fallback
             cached = self.browse_details.get(item["id"])
             try:
@@ -298,10 +304,31 @@ class ModHubClient:
         return {"query": query.strip(), "category": category or "", "page": page,
                 "has_next": max(parsed.page_numbers, default=page) > page, "items": items}
 
-    def download_mod(self, hub, mod_id, progress=None):
-        entry = self.detail(mod_id)
+    def _find_dependency_on_modhub(self, filename, progress=None):
+        title = Path(filename).stem
+        for page in range(3):
+            parameters = {"title": "fs2025", "lang": "en", "page": page, "searchMod": title}
+            parsed = SearchPage()
+            parsed.feed(self._fetch(BASE + "mods.php?" + urllib.parse.urlencode(parameters)))
+            for candidate in parsed.items[:8]:
+                if progress:
+                    progress(f"Looking for {filename} on the official ModHub…")
+                try:
+                    entry = self.detail(candidate["id"])
+                except (HubError, OSError, ValueError):
+                    continue
+                if entry["filename"].casefold() == filename.casefold():
+                    return entry
+            if max(parsed.page_numbers, default=page) <= page:
+                break
+        return None
+
+    def _download_entry(self, hub, entry, progress=None, expected_filename=None):
         name = entry["filename"]
-        if name in hub.mods or (hub.data / "imports" / name).exists():
+        if expected_filename and name.casefold() != expected_filename.casefold():
+            raise HubError(f"The source returned {name}, not the required dependency {expected_filename}.")
+        destination = hub.main_mod_directory() / name
+        if name in hub.mods or destination.exists():
             raise HubError("This mod is already installed. Use Mod updates to replace it with a newer version.")
         with tempfile.TemporaryDirectory(prefix=".hub-download-", dir=hub.data) as directory:
             download = Path(directory) / name
@@ -310,7 +337,69 @@ class ModHubClient:
             imported, skipped = hub.import_mods([download], progress)
             if not imported:
                 raise HubError("\n".join(skipped) or "The mod could not be imported. Existing files were kept.")
-        return {"name": name, "title": entry["title"], "version": entry["version"], "path": hub.data / "imports" / name}
+        with self.lock:
+            self.cache["entries"][name] = entry
+            try:
+                write_json(self.cache_path, self.cache)
+            except OSError:
+                pass
+        return {"name": name, "title": entry["title"], "version": entry["version"], "path": destination}
+
+    def download_mod(self, hub, mod_id, progress=None, expected_filename=None):
+        entry = self.detail(mod_id)
+        return self._download_entry(hub, entry, progress, expected_filename)
+
+    def _download_trusted_dependency(self, hub, filename, progress=None):
+        cached = self.cache["entries"].get(filename, {})
+        repo = cached.get("repo") if cached.get("trusted_repo") else None
+        repo = repo or KNOWN_REPOSITORIES.get(filename)
+        if not repo:
+            return None
+        mod = {"name": filename, "title": Path(filename).stem, "author": "", "path": "",
+               "trusted_dependency": True}
+        entry = self.github.check_repo(mod, repo, cached, trusted=True)
+        if entry.get("release_unavailable") or not entry.get("package_verified"):
+            return None
+        if entry.get("filename", "").casefold() != filename.casefold():
+            return None
+        with tempfile.TemporaryDirectory(prefix=".hub-dependency-", dir=hub.data) as directory:
+            download = Path(directory) / filename
+            self._download(entry["download_url"], download, progress)
+            validate_download(download, entry, "Trusted GitHub release")
+            imported, skipped = hub.import_mods([download], progress)
+            if not imported:
+                raise HubError("\n".join(skipped) or "The dependency could not be imported.")
+        entry["source"] = "github"
+        entry["trusted_repo"] = True
+        with self.lock:
+            self.cache["entries"][filename] = entry
+            try:
+                write_json(self.cache_path, self.cache)
+            except OSError:
+                pass
+        return {"name": filename, "title": entry.get("title") or Path(filename).stem,
+                "version": entry["version"], "source": "GitHub"}
+
+    def install_missing_dependencies(self, hub, dependencies, progress=None):
+        """Install only exact-filename ModHub matches or trusted packaged GitHub releases."""
+        installed, unresolved = [], []
+        for dependency in sorted(set(dependencies)):
+            filename = dependency if dependency.lower().endswith(".zip") else dependency + ".zip"
+            if filename in hub.mods or (hub.main_mod_directory() / filename).exists():
+                continue
+            try:
+                entry = self._find_dependency_on_modhub(filename, progress)
+                if entry:
+                    installed.append(self._download_entry(hub, entry, progress, filename))
+                    continue
+                result = self._download_trusted_dependency(hub, filename, progress)
+                if result:
+                    installed.append(result)
+                    continue
+                unresolved.append({"name": filename, "error": "No exact ModHub match or trusted GitHub release was found."})
+            except (HubError, OSError, ValueError, GitHubError) as exc:
+                unresolved.append({"name": filename, "error": str(exc)})
+        return installed, unresolved
 
     def _check_one(self, mod):
         cached = self.cache["entries"].get(mod["name"], {})
@@ -320,7 +409,8 @@ class ModHubClient:
             try:
                 return self.github.check_repo(mod, repo, cached, trusted=bool(cached.get("trusted_repo") or mod["name"] in KNOWN_REPOSITORIES))
             except (GitHubError, OSError, ValueError) as exc:
-                return {**cached, "source": "github", "repo": repo, "url": "https://github.com/" + repo + "/releases", "error": str(exc)}
+                return {**cached, "source": "github", "repo": repo, "url": "https://github.com/" + repo + "/releases",
+                        "error": str(exc), "checked_at": datetime.now(timezone.utc).isoformat()}
         if cached.get("id"):
             entry = self.detail(cached["id"])
             if entry["filename"] == mod["name"]:
@@ -345,10 +435,30 @@ class ModHubClient:
             return {"unmatched": True, "github_error": str(exc), "checked_at": datetime.now(timezone.utc).isoformat()}
         return {"unmatched": True, "checked_at": datetime.now(timezone.utc).isoformat()}
 
-    def check_mods(self, mods, progress=None):
+    def check_mods(self, mods, progress=None, force=False):
         mods = list(mods)
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(self._check_one, mod): mod for mod in mods}
+        now = datetime.now(timezone.utc)
+        pending_mods = []
+        for mod in mods:
+            entry = self.cache["entries"].get(mod["name"], {})
+            checked_at = None
+            try:
+                checked_at = datetime.fromisoformat(entry.get("checked_at", ""))
+                if checked_at.tzinfo is None:
+                    checked_at = checked_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+            age = (now - checked_at).total_seconds() if checked_at else None
+            if (not force and not entry.get("error") and age is not None and 0 <= age < 24 * 60 * 60):
+                continue
+            pending_mods.append(mod)
+        if progress and len(pending_mods) < len(mods):
+            progress(f"Using recent results for {len(mods) - len(pending_mods)} mods…")
+        if not pending_mods:
+            return self.results({m["name"]: m for m in mods})
+
+        with ThreadPoolExecutor(max_workers=min(5, len(pending_mods))) as pool:
+            futures = {pool.submit(self._check_one, mod): mod for mod in pending_mods}
             failures = 0
             for index, future in enumerate(as_completed(futures), 1):
                 mod = futures[future]
@@ -370,7 +480,7 @@ class ModHubClient:
                     if index % 20 == 0:
                         write_json(self.cache_path, self.cache)
                 if progress:
-                    progress(f"Checking updates {index} / {len(mods)}: {mod['title']}")
+                    progress(f"Checking updates {index} / {len(pending_mods)}: {mod['title']}")
         self.cache["checked_at"] = datetime.now(timezone.utc).isoformat()
         write_json(self.cache_path, self.cache)
         return self.results({m["name"]: m for m in mods})
@@ -516,4 +626,77 @@ class ModHubClient:
             write_json(self.cache_path, self.cache)
         except OSError:
             pass
+        return {"name": name, "version": updated["version"], "backup": backup}
+
+    def install_local_update(self, hub, name, source, progress=None):
+        """Replace an installed ZIP with a user-selected ZIP of the same mod."""
+        require_game_closed()
+        source = Path(source).expanduser().resolve()
+        mod = hub.mods.get(name)
+        if not mod or source.name != name or source.suffix.lower() != ".zip":
+            raise HubError("Choose a ZIP with the same filename as the installed mod.")
+        target = Path(mod["path"]).resolve()
+        if not target.is_file():
+            raise HubError("Only installed ZIP mods can be replaced by importing a ZIP.")
+        original_stamp = file_stamp(target)
+        if mod_info(target)["version"] != mod["version"]:
+            raise HubError("The installed mod changed. Rescan before replacing it.")
+        with tempfile.TemporaryDirectory(prefix=".hub-import-update-", dir=target.parent) as directory:
+            staged = Path(directory) / name
+            shutil.copy2(source, staged)
+            candidate = mod_info(staged)
+            if candidate["error"]:
+                raise HubError(f"{source.name}: {candidate['error']}. The installed copy was kept.")
+            updated = validate_download(staged, {"version": candidate["version"]}, "Imported file")
+            if not same_identity(mod, updated):
+                raise HubError("The imported ZIP does not match the installed mod's author and title. The installed copy was kept.")
+
+            prospective = {**hub.mods, name: updated}
+            by_stem = {Path(n).stem: n for n in prospective}
+            required, todo, missing = {name}, [name], set()
+            while todo:
+                for dependency in prospective[todo.pop()]["dependencies"]:
+                    filename = by_stem.get(dependency)
+                    if filename is None or prospective[filename]["error"] or not Path(prospective[filename]["path"]).exists():
+                        missing.add(dependency)
+                    elif filename not in required:
+                        required.add(filename)
+                        todo.append(filename)
+            if missing:
+                raise HubError("The imported version needs these dependencies. Import them first:\n" + "\n".join(sorted(missing)))
+
+            require_game_closed()
+            if file_stamp(target) != original_stamp:
+                raise HubError("The installed file changed during import. It was kept; rescan and try again.")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = hub.data / "mod-backups" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+            backup.mkdir(parents=True)
+            backup_file = backup / name
+            if progress:
+                progress("Backing up the installed mod…")
+            shutil.copy2(target, backup_file)
+            write_json(backup / "update.json", {"name": name, "path": str(target),
+                                               "previous_version": mod["version"], "version": updated["version"],
+                                               "source": "import"})
+            (backup / "README.txt").write_text("To restore this version, close FS25 and copy the ZIP in this folder back to:\n" + str(target) + "\nThen rescan FS25 ModYard.\n")
+            require_game_closed()
+            if file_stamp(target) != original_stamp:
+                raise HubError("The installed file changed while backing it up. It was kept.")
+            selections = [(loadout, loadout["mods"]) for loadout in hub.config["loadouts"] if name in loadout["mods"]]
+            for loadout, names in selections:
+                loadout["mods"] = sorted(set(names) | required)
+            try:
+                shutil.copymode(target, staged)
+                os.replace(staged, target)
+                try:
+                    hub.save_config()
+                except BaseException:
+                    shutil.copy2(backup_file, staged)
+                    os.replace(staged, target)
+                    raise
+            except BaseException:
+                for loadout, names in selections:
+                    loadout["mods"] = names
+                raise
+        hub.mods[name] = mod_info(target)
         return {"name": name, "version": updated["version"], "backup": backup}

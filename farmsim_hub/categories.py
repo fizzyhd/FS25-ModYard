@@ -61,6 +61,7 @@ MODHUB_CATEGORIES["Wheel loaders"] = "wheelLoaderVehicles"
 MODHUB_CATEGORIES["Stump cutters"] = "forestryStumpCutters"
 MODHUB_CATEGORIES["Tree planters"] = "forestryPlanters"
 MODHUB_CATEGORIES["Shipping containers"] = "containers"
+MODHUB_CATEGORIES["Gameplay & scripts"] = "gameplay"
 
 
 def modhub_category_for_query(query):

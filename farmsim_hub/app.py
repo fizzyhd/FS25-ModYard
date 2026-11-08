@@ -4,6 +4,7 @@ import copy
 import html
 import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gi
@@ -106,6 +107,11 @@ class Window(Gtk.Window):
             self.placeholder = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, THUMBNAIL_SIZE, THUMBNAIL_SIZE)
             self.placeholder.fill(0x2B3A40FF)
         self.busy = False
+        self.game_was_running = game_running()
+        self.pending_applied_download_move = not self.game_was_running
+        self.startup_library_scan_pending = bool(auto_scan)
+        self.startup_update_check_pending = bool(auto_scan)
+        self.startup_update_check_running = False
         self.current = None
         self.error = None
         self.set_default_size(1360, 850)
@@ -115,6 +121,8 @@ class Window(Gtk.Window):
         if icon_file.is_file():
             self.set_icon_from_file(str(icon_file))
         self.connect("delete-event", self._closing)
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)], Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self._files_dropped)
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS + LIBRARY_CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -171,9 +179,60 @@ class Window(Gtk.Window):
         Gtk.main_quit()
         return False
 
+    def _files_dropped(self, _widget, context, _x, _y, selection, _info, timestamp):
+        if self.busy:
+            context.finish(False, False, timestamp)
+            return
+        files = []
+        for uri in selection.get_uris() or []:
+            path = Gio.File.new_for_uri(uri).get_path()
+            if path and Path(path).suffix.lower() == ".zip":
+                files.append(Path(path))
+        context.finish(bool(files), False, timestamp)
+        if files:
+            self.import_files(files)
+        else:
+            self.toast("Drop one or more .zip mod files to import them.")
+
     def _game_status(self):
-        self.game_status.set_text("● FS25 running" if game_running() else "● FS25 closed")
+        running = game_running()
+        self.game_status.set_text("● FS25 running" if running else "● FS25 closed")
+        if running:
+            self.game_was_running = True
+        elif self.game_was_running:
+            self.game_was_running = False
+            self.pending_applied_download_move = True
+        if (not running and self.pending_applied_download_move and not self.busy and
+                not self.startup_library_scan_pending):
+            self._move_applied_downloads_when_closed()
         return True
+
+    def _move_applied_downloads_when_closed(self):
+        folder = self.hub.applied_download_directory()
+        try:
+            candidates = ([path for path in folder.iterdir()
+                          if path.is_file() and not path.is_symlink() and path.suffix.lower() == ".zip"]
+                         if folder else [])
+        except OSError:
+            candidates = []
+        self.pending_applied_download_move = False
+        if not candidates:
+            return
+
+        def work(progress):
+            result = self.hub.move_applied_downloads(progress)
+            if result["moved"]:
+                self._scan_library(progress)
+            return result
+
+        def finished(result):
+            self.loaded()
+            if result["moved"]:
+                self.toast(f"Moved {len(result['moved'])} in-game mod{'s' if len(result['moved']) != 1 else ''} to the FS25 mod folder")
+            if result["skipped"]:
+                self.notice("\n".join(result["skipped"][:12]), "Some in-game mods were left in the loadout folder")
+
+        self._run(work, finished, "Moving in-game mods into the FS25 mod folder…")
 
     def toast(self, text):
         self.status.set_text(text)
@@ -234,8 +293,54 @@ class Window(Gtk.Window):
     def refresh(self):
         if self.busy:
             return False
-        self._run(self._scan_library, lambda _: self.loaded(), "Scanning your mod library…")
+        def finished(_):
+            self.startup_library_scan_pending = False
+            self.loaded()
+            if self.startup_update_check_pending:
+                self.startup_update_check_pending = False
+                self._start_startup_update_check()
+        self._run(self._scan_library, finished, "Scanning your mod library…")
         return False
+
+    def _start_startup_update_check(self):
+        if not self.hub.config.get("auto_check_updates", True) or not self.hub.mods:
+            return
+        now = datetime.now(timezone.utc)
+        stale = []
+        for name, mod in self.hub.mods.items():
+            entry = self.modhub.cache["entries"].get(name, {})
+            try:
+                checked = datetime.fromisoformat(entry.get("checked_at", "")).replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                checked = None
+            if checked is None or (now - checked).total_seconds() >= 24 * 60 * 60:
+                stale.append(copy.deepcopy(mod))
+        if not stale:
+            return
+        self.startup_update_check_running = True
+        self.toast(f"Checking updates for {len(stale)} mods in the background…")
+
+        def progress(message):
+            GLib.idle_add(self.toast, message)
+
+        def finished(results=None, error=None):
+            self.startup_update_check_running = False
+            self._render_updates()
+            if error:
+                self.toast("Automatic update check stopped: " + str(error).splitlines()[0])
+            else:
+                available = sum(item["status"] == "Update available" for item in self.modhub.results(self.hub.mods))
+                self.toast(f"Automatic update check complete · {available} updates available")
+
+        def worker():
+            try:
+                results = self.modhub.check_mods(stale, progress)
+            except Exception as exc:
+                GLib.idle_add(finished, None, exc)
+            else:
+                GLib.idle_add(finished, results, None)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _scan_library(self, progress):
         self.hub.scan(progress)
@@ -450,7 +555,10 @@ class Window(Gtk.Window):
     def _counts(self):
         self.library.apply_button.set_sensitive(self.current is not None)
         self.library.launch_button.set_sensitive(self.current is not None)
+        self.library.launch_all_button.set_sensitive((self.hub.profile / "gameSettings.xml").is_file())
         names = self.current["mods"] if self.current else []
+        missing_dependencies = self.hub.dependency_closure(names)[1] if self.current else set()
+        self.library.dependencies_item.set_sensitive(bool(missing_dependencies))
         missing = sum(n not in self.hub.mods for n in names)
         highlighted = len(self.library.highlighted_names())
         self.library.update_collection_controls()
@@ -459,7 +567,7 @@ class Window(Gtk.Window):
                             (f" · {highlighted} highlighted" if highlighted else ""))
         favourites = len(set(self.hub.config["favorites"]) & set(self.hub.mods))
         maps = sum(m["kind"] == "Maps" for m in self.hub.mods.values())
-        self.library.subtitle.set_text(f"{len(self.hub.mods)} mods installed · {favourites} favourited")
+        self.library.subtitle.set_text(f"{len(self.hub.mods)} mods installed · {favourites} favourited · Drop ZIPs here to import")
         for key, value in {"installed": len(self.hub.mods), "favourites": favourites, "maps": maps,
                            "disk": size_text(sum(m["size"] for m in self.hub.mods.values()))}.items():
             self.library.stats[key].set_text(str(value))
@@ -476,6 +584,60 @@ class Window(Gtk.Window):
         self.library.update()
         self._counts()
         self.toast("Loadout saved" + (f" · {len(missing)} missing mods or dependencies" if missing else " · Apply it when you are ready to play"))
+        if missing:
+            self.find_missing_dependencies(missing)
+
+    def find_missing_dependencies(self, missing=None):
+        if self.startup_update_check_running:
+            self.notice("Wait for the automatic update check to finish before searching for dependencies.")
+            return
+        if not self.current:
+            self.notice("Choose a loadout first.")
+            return
+        missing = set(missing or self.hub.dependency_closure(self.current["mods"])[1])
+        if not missing:
+            self.toast("This loadout has no missing mod dependencies.")
+            return
+        shown = sorted(missing)
+        preview = "\n".join(shown[:12]) + (f"\n…and {len(shown) - 12} more" if len(shown) > 12 else "")
+        if not self.confirm("Find and install missing dependencies?",
+                            preview + "\n\nModYard will install only an exact filename match from the official ModHub or a trusted, packaged GitHub release. Downloads go to your FS25 mod folder. The game will not be launched."):
+            return
+
+        def work(progress):
+            pending = set(missing)
+            installed, failure_map = [], {}
+            for _ in range(5):
+                if not pending:
+                    break
+                found, failures = self.modhub.install_missing_dependencies(self.hub, pending, progress)
+                installed.extend(found)
+                failure_map.update({failure["name"]: failure["error"] for failure in failures})
+                if not found:
+                    break
+                self._scan_library(progress)
+                closure, pending = self.hub.dependency_closure(self.current["mods"])
+                self.hub.set_selection(self.current, closure)
+            unresolved = sorted(set(pending) | {name[:-4] for name in failure_map
+                                                if name not in self.hub.mods and name[:-4] not in self.hub.mods})
+            return {"installed": installed, "unresolved": unresolved, "errors": failure_map}
+
+        def finished(result):
+            self.loaded()
+            if result["unresolved"]:
+                names = result["unresolved"]
+                self.notice("These dependencies still need attention:\n\n" + "\n".join(names[:12]) +
+                            (f"\n…and {len(names) - 12} more" if len(names) > 12 else "") +
+                            "\n\nModYard will search the official ModHub for the first one. If there is no exact result, check its trusted GitHub source.",
+                            "Some dependencies were not found")
+                self.go("Find mods")
+                self.mod_browser.search.set_text(Path(names[0]).stem)
+                self.mod_browser.category_combo.set_active(0)
+                self.search_modhub()
+            else:
+                self.toast(f"Installed {len(result['installed'])} required mods. Review the loadout, then apply it when ready.")
+
+        self._run(work, finished, "Finding and installing required mods…")
 
 
     def _toggle(self, _, path, column):
@@ -528,6 +690,8 @@ class Window(Gtk.Window):
         info.pack_start(label(mod["title"], "title", True), False, False, 0)
         info.pack_start(label(f"{mod['author']} · v{mod['version']}", "muted", True), False, False, 0)
         info.pack_start(label(", ".join(mod.get("categories", [mod["kind"]])) + " · " + size_text(mod["size"]), wrap=True), False, False, 0)
+        if mod.get("error"):
+            info.pack_start(label("Needs attention: " + mod["error"], "muted", True), False, False, 0)
         info.pack_start(label("Dependencies: " + (", ".join(mod["dependencies"]) or "None"), wrap=True), False, False, 0)
         filename = label(name, "muted", True)
         filename.set_selectable(True)
@@ -642,6 +806,47 @@ class Window(Gtk.Window):
         if collection and names:
             self._save_collection_members(collection, set(collection["mods"]) - set(names))
 
+    def delete_mods(self):
+        names = self.library.highlighted_names()
+        if not names:
+            self.notice("Highlight mod pictures first. Use Ctrl-click or Shift-click to select several mods.")
+            return
+        try:
+            impact = self.hub.mod_deletion_impact(names)
+        except (HubError, OSError) as exc:
+            self.notice(exc)
+            return
+
+        shown = impact["names"][:10]
+        details = ["Permanently delete these mod files from every scanned mod folder?\n\n" +
+                   "\n".join(shown) + (f"\n…and {len(impact['names']) - len(shown)} more" if len(impact["names"]) > len(shown) else ""),
+                   f"{len(impact['files'])} file or folder copies will be deleted. Mod names will be removed from all loadouts, collections, and favourites. Farm saves will not be deleted. Close FS25 before continuing."]
+        if impact["loadouts"]:
+            details.append(f"These mods are referenced by {len(impact['loadouts'])} loadouts, which will no longer include them.")
+        if not impact["files"]:
+            details.append("No mod files were found; this will clear the selected missing-mod references only.")
+        if not self.confirm("Delete mod files?", "\n\n".join(details)):
+            return
+
+        def work(progress):
+            result = self.hub.delete_mods(names)
+            self._scan_library(progress)
+            return result
+
+        def finished(result):
+            collection_name = (self.library.collection_filter or {}).get("name")
+            self.loaded()
+            if collection_name:
+                self.library.collection_filter = next((collection for collection in self.hub.config["collections"]
+                                                       if collection["name"] == collection_name), None)
+                self._filter_changed()
+            self.toast(f"Deleted {len(result['names'])} mods · {result['files']} files")
+            if result["cleanup_pending"]:
+                self.notice("The mods were removed from the library, but temporary deletion folders could not be fully cleaned up:\n\n" +
+                            "\n".join(result["cleanup_pending"]), "Deletion cleanup incomplete")
+
+        self._run(work, finished, "Deleting mods and rescanning the library…")
+
     def edit_collection(self, collection):
         if collection is None:
             return
@@ -695,51 +900,98 @@ class Window(Gtk.Window):
             self._save_collection_members(collection, names)
 
 
-    def apply(self, launch=False):
-        if not self.current:
+    def apply(self, launch=False, loadout_override=None):
+        target = loadout_override or self.current
+        if not target:
             return
         try:
             if game_running():
                 raise HubError("Close FS25 before applying or launching a loadout.")
-            self.hub.validate_loadout(self.current)
+            self.hub.validate_loadout(target)
         except HubError as exc:
+            missing = self.hub.dependency_closure(target["mods"])[1]
+            if missing and not game_running():
+                self.find_missing_dependencies(missing)
+                return
             self.notice(exc)
             return
-        save = self.hub.save_for(self.current)
-        text = f"Use {len(self.current['mods'])} mods from “{self.current['name']}”.\n\n"
+        save = self.hub.save_for(target)
+        text = f"Use {len(target['mods'])} mods from “{target['name']}”.\n\n"
         if save:
-            selected = {Path(n).stem for n in self.current["mods"]}
+            selected = {Path(n).stem for n in target["mods"]}
             removed = [m["title"] for m in save["mods"] if not m["modName"].startswith("pdlc_") and m["modName"] not in selected]
             text += f"This updates mod selections for Save {save['slot']} ({save['map']}). "
             if removed:
                 text += f"{len(removed)} previously active mods will be deselected. Objects from removed mods may disappear when you next save in-game. "
-            if "dlcs" in self.current:
-                text += f"Use {len(self.hub.selected_dlcs(self.current))} selected DLCs. "
+            if "dlcs" in target:
+                text += f"Use {len(self.hub.selected_dlcs(target))} selected DLCs. "
                 deselected_dlcs = [m["title"] for m in save["mods"] if m["modName"].startswith("pdlc_")
-                                   and m["modName"] not in self.hub.selected_dlcs(self.current)]
+                                   and m["modName"] not in self.hub.selected_dlcs(target)]
                 if deselected_dlcs:
                     text += "Deselecting DLC can remove its objects when you next save in-game. "
             text += "A full save backup is created first.\n\n"
         else:
             text += "This sets the game's mod folder. Choose your save and enable mods in-game.\n\n"
-            if "dlcs" in self.current:
+            if "dlcs" in target:
                 text += "Choose this loadout's DLCs in-game, or link it to a save under DLC choices to apply those selections.\n\n"
         text += "Your library and existing mod-switcher profiles stay in place."
+        selected_names = set(target["mods"])
+        duplicate_mods = [duplicate for duplicate in self.hub.duplicates if duplicate.get("name") in selected_names]
+        if duplicate_mods:
+            duplicate_names = sorted({duplicate["name"] for duplicate in duplicate_mods})
+            text += ("\n\nWarning: duplicate copies of these selected mods were found. ModYard will use the first scanned copy and ignore the others:\n" +
+                     "\n".join(duplicate_names[:8]) + (f"\n…and {len(duplicate_names) - 8} more" if len(duplicate_names) > 8 else ""))
         if not self.confirm("Apply and launch FS25?" if launch else "Apply this loadout?", text):
             return
-        loadout = copy.deepcopy(self.current)
+        loadout = copy.deepcopy(target)
 
         def work(progress):
+            move_result = self.hub.move_applied_downloads(progress)
+            if move_result["moved"]:
+                self._scan_library(progress)
             backup = self.hub.apply(loadout, progress)
             if launch:
                 self.hub.launch(loadout.get("slot"))
-            return backup
+            return backup, move_result
 
-        def finished(backup):
+        def finished(result):
+            backup, move_result = result
             self.toast("Launch sent to Steam. Backup created." if launch else "Loadout applied. Full backup created.")
+            if move_result["moved"]:
+                self.toast(f"Moved {len(move_result['moved'])} in-game mods into the FS25 mod folder before applying.")
+            if move_result["skipped"]:
+                self.notice("\n".join(move_result["skipped"][:12]), "Some in-game mods were left in the loadout folder")
             self._render_backups()
+            self._refresh_preferences()
 
         self._run(work, finished, "Preparing your loadout…")
+
+    def launch_all_mods(self):
+        if game_running():
+            self.notice("Close FS25 before disabling the ModYard loadout and launching the game.")
+            return
+        if not self.confirm("Launch FS25 normally?",
+                            "Restore the mod-folder setting from before ModYard applied a loadout, then open FS25. "
+                            "Your saves and saved loadouts will not be changed. ModYard will back up the current game settings first."):
+            return
+
+        def work(progress):
+            move_result = self.hub.move_applied_downloads(progress)
+            backup = self.hub.disable_active_loadout()
+            self._scan_library(progress)
+            self.hub.launch()
+            return backup, move_result
+
+        def finished(result):
+            backup, move_result = result
+            self.loaded()
+            self.toast("FS25 launched normally" + (" · game settings backed up" if backup else ""))
+            if move_result["moved"]:
+                self.toast(f"Moved {len(move_result['moved'])} in-game mods into the FS25 mod folder before launching.")
+            if move_result["skipped"]:
+                self.notice("\n".join(move_result["skipped"][:12]), "Some in-game mods were left in the loadout folder")
+
+        self._run(work, finished, "Disabling the ModYard loadout…")
 
     def _replace_page(self, name, title, subtitle):
         page = self.pages[name]
@@ -765,6 +1017,9 @@ class Window(Gtk.Window):
             actions.pack_start(button("Settings", lambda s=save: self.edit_settings(s)), False, False, 0)
             actions.pack_start(button("Backup", lambda s=save: self.make_backup(s)), False, False, 0)
             actions.pack_start(button("Clone", lambda s=save: self.clone_save(s)), False, False, 0)
+            remove = button("Delete save", lambda s=save: self.delete_save(s))
+            remove.get_style_context().add_class("destructive-action")
+            actions.pack_start(remove, False, False, 0)
             row.pack_end(actions, False, False, 0)
             content.pack_start(row, False, False, 0)
         if not self.hub.saves:
@@ -842,6 +1097,27 @@ class Window(Gtk.Window):
         self._run(lambda _: self.hub.backup(save["slot"]),
                   lambda _: (self._render_backups(), self.toast(f"Save {save['slot']} backed up.")), "Backing up the complete save…")
 
+    def delete_save(self, save):
+        slot = save["slot"]
+        if not self.confirm(f"Delete Save {slot} · {save['name']}?",
+                            f"This removes the save folder and its farm progress. ModYard creates a full backup first, so you can restore it later from Backups.\n\n"
+                            "Loadouts linked to this save will be kept as independent loadouts. Close FS25 before continuing."):
+            return
+
+        def work(progress):
+            result = self.hub.delete_save(slot)
+            self._scan_library(progress)
+            return result
+
+        def finished(result):
+            self.loaded()
+            self.toast(f"Deleted Save {slot} · backup created")
+            if result["cleanup_pending"]:
+                self.notice(f"The save is backed up and removed from FS25, but this temporary folder could not be cleaned up:\n\n{result['cleanup_pending']}",
+                            "Deletion cleanup incomplete")
+
+        self._run(work, finished, f"Backing up and deleting Save {slot}…")
+
     def clone_save(self, save):
         name, _ = self.name_dialog("Name the cloned farm", save["name"] + " (copy)")
         if not name:
@@ -912,7 +1188,7 @@ class Window(Gtk.Window):
         actions = box(False, 10)
         actions.pack_start(button("New loadout", self.create_loadout), False, False, 0)
         actions.pack_start(button("Clone current loadout", lambda: self.create_loadout(True)), False, False, 0)
-        actions.pack_start(button("Import ZIP mods", self.import_files), False, False, 0)
+        actions.pack_start(button("Import or update ZIP mods", self.import_files), False, False, 0)
         page.pack_end(actions, False, False, 0)
         if not self.hub.loadouts():
             content.pack_start(label("No loadouts yet. Choose New loadout, or open a save's Mods button to make one from that farm.", "detail", True), False, False, 0)
@@ -1053,8 +1329,10 @@ class Window(Gtk.Window):
         page, content = self._replace_page("Mod updates", "ModHub and GitHub updates",
                                           f"{updates} updates available · {matched} matched · {unmatched} without an exact match · {len(self.hub.mods) - len(results)} unchecked")
         actions = box(False, 8)
-        actions.pack_start(button("Check current loadout", lambda: self.check_mod_updates(True)), False, False, 0)
-        actions.pack_start(button("Check all mods", self.check_mod_updates, True), False, False, 0)
+        actions.pack_start(button("Quick check current loadout", lambda: self.check_mod_updates(True)), False, False, 0)
+        actions.pack_start(button("Quick check all mods", self.check_mod_updates, True), False, False, 0)
+        actions.pack_start(button("Force refresh current loadout", lambda: self.check_mod_updates(True, force=True)), False, False, 0)
+        actions.pack_start(button("Download all available updates", self.install_all_mod_updates, True), False, False, 0)
         actions.pack_start(button("Open mod backups", lambda: self.open_folder(self.hub.data / "mod-backups")), False, False, 0)
         page.pack_end(actions, False, False, 0)
         if not results:
@@ -1126,11 +1404,14 @@ class Window(Gtk.Window):
         checked_at = self.modhub.cache.get("checked_at")
         if checked_at:
             content.pack_end(label("Last check: " + checked_at[:19].replace("T", " ") + " UTC", "muted"), False, False, 0)
-        content.pack_end(label("Updates use official ModHub downloads or matching GitHub release ZIPs and keep a backup. GitHub checks verify the packaged filename, mod identity, and available checksum. Updating a shared file affects every loadout using it.", "muted", True), False, False, 0)
+        content.pack_end(label("Quick checks reuse results from the last 24 hours. Force refresh checks the current loadout again. Updates use official ModHub downloads or matching GitHub release ZIPs and keep a backup.", "muted", True), False, False, 0)
         page.show_all()
         filter_rows()
 
-    def check_mod_updates(self, current_only=False):
+    def check_mod_updates(self, current_only=False, force=False):
+        if self.startup_update_check_running:
+            self.notice("The automatic update check is still running. Please wait for it to finish before starting another check.")
+            return
         if current_only and not self.current:
             self.notice("Choose a loadout first.")
             return
@@ -1139,14 +1420,18 @@ class Window(Gtk.Window):
         if not mods:
             self.notice("There are no installed mods in this selection to check.")
             return
-        self._run(lambda progress: self.modhub.check_mods(mods, progress),
-                  lambda _: self._updates_finished(), "Checking ModHub and GitHub releases…")
+        message = "Refreshing ModHub and GitHub results…" if force else "Checking cached update results…"
+        self._run(lambda progress: self.modhub.check_mods(mods, progress, force=force),
+                  lambda _: self._updates_finished(), message)
 
     def _updates_finished(self):
         self.go("Mod updates")
         self.toast("Update check complete. Review available updates and unmatched mods.")
 
     def link_modhub_page(self, name):
+        if self.startup_update_check_running:
+            self.notice("Wait for the automatic update check to finish before changing update sources.")
+            return
         dialog = Gtk.Dialog(title="Link mod update source", transient_for=self, modal=True)
         dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Check page", Gtk.ResponseType.OK)
         content = dialog.get_content_area()
@@ -1164,6 +1449,9 @@ class Window(Gtk.Window):
             self._run(lambda _: self.modhub.link(mod, url), lambda _: self._updates_finished(), "Verifying the mod update source…")
 
     def install_mod_update(self, result):
+        if self.startup_update_check_running:
+            self.notice("Wait for the automatic update check to finish before installing an update.")
+            return
         if game_running():
             self.notice("Close FS25 before replacing an installed mod.")
             return
@@ -1183,6 +1471,45 @@ class Window(Gtk.Window):
             self.go("Mod updates")
             self.toast(f"Updated {updated['name']} to {updated['version']} · previous ZIP backed up")
         self._run(work, finished, "Downloading the mod update…")
+
+    def install_all_mod_updates(self):
+        if self.startup_update_check_running:
+            self.notice("Wait for the automatic update check to finish before installing updates.")
+            return
+        if game_running():
+            self.notice("Close FS25 before replacing mods.")
+            return
+        updates = [result for result in self.modhub.results(self.hub.mods) if result["can_update"]]
+        if not updates:
+            self.notice("No verified updates are ready to install. Check for updates first.")
+            return
+        names = [result["local_title"] for result in updates]
+        preview = "\n".join(names[:12]) + (f"\n…and {len(names) - 12} more" if len(names) > 12 else "")
+        if not self.confirm(f"Install {len(updates)} mod updates?",
+                            preview + "\n\nEach existing ZIP will be backed up before replacement. Every loadout using an updated mod will use its new version."):
+            return
+
+        def work(progress):
+            updated, failed = [], []
+            for index, result in enumerate(updates, 1):
+                progress(f"Updating {index} / {len(updates)}: {result['local_title']}…")
+                try:
+                    updated.append(self.modhub.install_update(self.hub, result["name"], progress))
+                except Exception as exc:
+                    failed.append(f"{result['local_title']}: {exc}")
+            self._scan_library(progress)
+            return updated, failed
+
+        def finished(result):
+            updated, failed = result
+            self.loaded()
+            self.go("Mod updates")
+            self.toast(f"Updated {len(updated)} mods · {len(failed)} failed")
+            if failed:
+                self.notice("Successful updates were backed up. These updates were not installed:\n\n" +
+                            "\n".join(failed[:12]), "Some updates could not be installed")
+
+        self._run(work, finished, "Installing verified mod updates…")
 
     def search_modhub(self, page=None, latest=False):
         if self.busy:
@@ -1225,7 +1552,10 @@ class Window(Gtk.Window):
             dialog.destroy()
             if response == Gtk.ResponseType.OK:
                 if installed:
-                    self._run(lambda progress: self.modhub.check_mods([copy.deepcopy(installed)], progress), lambda _: self._updates_finished(), "Checking the installed mod…")
+                    if self.startup_update_check_running:
+                        self.notice("Wait for the automatic update check to finish before starting another check.")
+                        return
+                    self._run(lambda progress: self.modhub.check_mods([copy.deepcopy(installed)], progress, force=True), lambda _: self._updates_finished(), "Checking the installed mod…")
                 else:
                     self.download_modhub_mod(entry["id"])
         self._run(lambda _: self.modhub.detail(item["id"]), details, "Loading ModHub details…")
@@ -1239,10 +1569,7 @@ class Window(Gtk.Window):
         def finished(result):
             self.loaded()
             self.toast(f"Downloaded {result['title']} v{result['version']} · available in Mod Manager")
-            self.go("Mod library")
-            self.library.filter_to("All mods")
-            self.search.set_text(result["name"])
-            self._filter_changed()
+            self.go("Find mods")
             missing = self.hub.dependency_closure([result["name"]])[1]
             if missing:
                 self.notice("This mod also needs:\n" + "\n".join(sorted(missing)) + "\n\nUse Find mods to download its dependencies.", "Mod downloaded")
@@ -1294,6 +1621,11 @@ class Window(Gtk.Window):
     def _build_preferences(self):
         page = self.pages["Preferences"]
         self.heading(page, "Your Linux setup", "Point the hub at FS25 and the folders where you keep mods.")
+        self.auto_update_check = Gtk.CheckButton(label="Check for mod updates automatically")
+        self.auto_update_check.set_active(self.hub.config.get("auto_check_updates", True))
+        self.auto_update_check_signal = self.auto_update_check.connect("toggled", self._save_auto_update_preference)
+        page.pack_start(self.auto_update_check, False, False, 0)
+        page.pack_start(label("Checks ModHub and saved GitHub sources at startup, at most once every 24 hours. This contacts those services using your installed mod names and titles.", "muted", True), False, False, 0)
         self.profile_label = label("", "detail", True)
         self.profile_label.set_selectable(True)
         page.pack_start(label("FS25 USER FOLDER", "eyebrow"), False, False, 0)
@@ -1304,22 +1636,47 @@ class Window(Gtk.Window):
         row.pack_start(button("Open folder", lambda: self.open_folder(self.hub.profile)), False, False, 0)
         page.pack_start(row, False, False, 0)
         page.pack_start(label("MOD SOURCES", "eyebrow"), False, False, 6)
-        self.sources_label = label("", "detail", True)
-        self.sources_label.set_selectable(True)
-        page.pack_start(scroll(self.sources_label), True, True, 0)
+        self.sources_list = box(spacing=6)
+        page.pack_start(scroll(self.sources_list), True, True, 0)
+        page.pack_start(label("Removing a source stops scanning it but leaves its folder and files untouched.", "muted", True), False, False, 0)
         page.pack_start(button("Add a mod folder", self.add_source), False, False, 0)
         self.diagnostics = label("", "muted", True)
         page.pack_start(self.diagnostics, False, False, 0)
 
     def _refresh_preferences(self):
         self.profile_label.set_text(str(self.hub.profile) if (self.hub.profile / "gameSettings.xml").exists() else "No FS25 user folder detected")
-        self.sources_label.set_text("\n\n".join(map(str, self.hub.mod_directories())) or "No mod sources found")
-        text = f"App data and imports: {self.hub.data}"
+        self.auto_update_check.handler_block(self.auto_update_check_signal)
+        self.auto_update_check.set_active(self.hub.config.get("auto_check_updates", True))
+        self.auto_update_check.handler_unblock(self.auto_update_check_signal)
+        for child in self.sources_list.get_children():
+            self.sources_list.remove(child)
+        sources = self.hub.mod_directories()
+        active_applied = self.hub.active_applied_directory()
+        if sources:
+            for source in sources:
+                row = box(False, 8, 8)
+                row.get_style_context().add_class("detail")
+                path = label(("Active loadout · in-game downloads\n" if source == active_applied else "") + str(source), wrap=True)
+                path.set_selectable(True)
+                row.pack_start(path, True, True, 0)
+                if source != active_applied:
+                    remove = button("Remove", lambda p=source: self.remove_source(p))
+                    remove.get_style_context().add_class("destructive-action")
+                    row.pack_start(remove, False, False, 0)
+                self.sources_list.pack_start(row, False, False, 0)
+        else:
+            self.sources_list.pack_start(label("No mod sources found"), False, False, 0)
+        text = f"App data: {self.hub.data}\nFS25 mod folder: {self.hub.main_mod_directory()}"
         if self.hub.duplicates:
             text += f"\n{len(self.hub.duplicates)} duplicate filenames found; the first source is used."
         if self.hub.scan_errors:
             text += "\n" + "\n".join(self.hub.scan_errors[:3])
         self.diagnostics.set_text(text)
+        self.sources_list.show_all()
+
+    def _save_auto_update_preference(self, widget):
+        self.hub.config["auto_check_updates"] = widget.get_active()
+        self.hub.save_config()
 
     def folder_dialog(self, title):
         dialog = Gtk.FileChooserDialog(title=title, transient_for=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
@@ -1351,36 +1708,122 @@ class Window(Gtk.Window):
     def add_source(self):
         path = self.folder_dialog("Choose a folder containing ZIP mods")
         if path:
-            value = str(path.resolve())
-            if value not in self.hub.config["mod_dirs"]:
-                self.hub.config["mod_dirs"].append(value)
-                self.hub.save_config()
+            try:
+                self.hub.add_mod_source(path)
+            except HubError as exc:
+                self.notice(exc)
+                return
             self.refresh()
 
-    def import_files(self):
-        dialog = Gtk.FileChooserDialog(title="Import FS25 ZIP mods", transient_for=self, action=Gtk.FileChooserAction.OPEN)
-        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Import", Gtk.ResponseType.OK)
-        dialog.set_select_multiple(True)
-        file_filter = Gtk.FileFilter()
-        file_filter.set_name("ZIP mods")
-        file_filter.add_pattern("*.zip")
-        file_filter.add_pattern("*.ZIP")
-        dialog.add_filter(file_filter)
-        response = dialog.run()
-        files = [Path(f) for f in dialog.get_filenames()] if response == Gtk.ResponseType.OK else []
-        dialog.destroy()
+    def remove_source(self, path):
+        try:
+            impact = self.hub.mod_source_removal_impact(path)
+        except HubError as exc:
+            self.notice(exc)
+            self.refresh()
+            return
+
+        details = [f"Stop scanning this folder?\n{impact['source']}",
+                   "The folder and its files will not be deleted."]
+        if impact["selected_missing"]:
+            names = impact["selected_missing"]
+            shown = names[:12]
+            suffix = f"\n…and {len(names) - len(shown)} more" if len(names) > len(shown) else ""
+            details.append("These selected mods are not available in another source and will become missing in their loadouts:\n"
+                           + "\n".join(shown) + suffix)
+        elif impact["unavailable"]:
+            details.append(f"{len(impact['unavailable'])} mods will disappear from the library, but none are selected in a loadout.")
+        elif not impact["mods"]:
+            details.append("This folder currently contains no mod files.")
+        else:
+            details.append("Every mod in this folder is available from another source.")
+
+        if self.confirm("Remove mod source?", "\n\n".join(details)):
+            try:
+                self.hub.remove_mod_source(path)
+            except HubError as exc:
+                self.notice(exc)
+                self.refresh()
+                return
+            self.refresh()
+
+    def import_files(self, files=None):
+        if files is None:
+            dialog = Gtk.FileChooserDialog(title="Import FS25 ZIP mods", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+            dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Import", Gtk.ResponseType.OK)
+            dialog.set_select_multiple(True)
+            file_filter = Gtk.FileFilter()
+            file_filter.set_name("ZIP mods")
+            file_filter.add_pattern("*.zip")
+            file_filter.add_pattern("*.ZIP")
+            dialog.add_filter(file_filter)
+            response = dialog.run()
+            files = [Path(f) for f in dialog.get_filenames()] if response == Gtk.ResponseType.OK else []
+            dialog.destroy()
         if files:
+            unique_files, seen_names = [], set()
+            for path in files:
+                if path.name not in seen_names:
+                    unique_files.append(path)
+                    seen_names.add(path.name)
+            files = unique_files
+            destination = self.hub.main_mod_directory()
+            if any(path.name not in self.hub.mods and (destination / path.name).exists() for path in files):
+                # A mod may have been copied into the game folder since the last
+                # library scan. Refresh it before deciding whether this is new or
+                # a replacement, so it cannot fall through to the duplicate skip.
+                try:
+                    self.hub.scan()
+                except (HubError, OSError) as exc:
+                    self.notice(f"Could not refresh the mod library before importing: {exc}")
+                    return
+            replacements = [path for path in files if path.name in self.hub.mods]
+            if replacements and self.startup_update_check_running:
+                self.notice("Wait for the automatic update check to finish before replacing installed mods.")
+                return
+            if replacements and game_running():
+                self.notice("Close FS25 before replacing installed mods.")
+                return
+            if replacements:
+                preview = "\n".join(
+                    f"{self.hub.mods[path.name]['title']} · {self.hub.mods[path.name]['version']}\n"
+                    f"Replacing: {self.hub.mods[path.name]['path']}"
+                    for path in replacements[:12])
+                if len(replacements) > 12:
+                    preview += f"\n…and {len(replacements) - 12} more"
+                if not self.confirm(f"Replace {len(replacements)} installed mod{'s' if len(replacements) != 1 else ''}?",
+                                    preview + "\n\nEach current ZIP will be backed up first. Loadouts using these mods will include any dependencies required by the imported versions."):
+                    return
+
             def work(progress):
-                result = self.hub.import_mods(files, progress)
+                updated, failures = [], []
+                new_files = []
+                for index, path in enumerate(files, 1):
+                    if path.name not in self.hub.mods:
+                        new_files.append(path)
+                imported, skipped = self.hub.import_mods(new_files, progress)
+                if new_files:
+                    self._scan_library(progress)
+                for index, path in enumerate(files, 1):
+                    if path.name not in {item.name for item in replacements}:
+                        continue
+                    progress(f"Updating {index} / {len(files)}: {path.name}")
+                    try:
+                        updated.append(self.modhub.install_local_update(self.hub, path.name, path, progress))
+                    except Exception as exc:
+                        failures.append(f"{path.name}: {exc}")
+                skipped.extend(failures)
                 self._scan_library(progress)
-                return result
+                return imported, skipped, updated
 
             def finished(result):
                 self.loaded()
-                imported, skipped = result
-                self.toast(f"Imported {len(imported)} mods · {len(skipped)} skipped")
+                imported, skipped, updated = result
+                self.toast(f"Imported {len(imported)} mods · updated {len(updated)} · {len(skipped)} skipped")
                 if skipped:
                     self.notice("\n".join(skipped[:12]), "Import results")
+                elif updated:
+                    self.notice("Updated mods were backed up in the Mod backups folder.", "Import complete")
 
             self._run(work, finished, "Importing mods…")
 
@@ -1394,7 +1837,7 @@ class Window(Gtk.Window):
     def _build_about(self):
         page = self.pages["About"]
         self.heading(page, "FS25 ModYard", "A native companion for Farming Simulator 25 on Linux.")
-        page.pack_start(label(f"Version {__version__}\n\nManage mods, per-save loadouts, DLC choices, collections, server exports, and backups. Find and download mods from the official ModHub, and check updates from ModHub or GitHub releases. Launch through Steam + Proton. Your library and setups are stored locally; searches and downloads contact their source sites when requested.", "detail", True), False, False, 0)
+        page.pack_start(label(f"Version {__version__}\n\nManage mods, per-save loadouts, DLC choices, collections, server exports, and backups. Find and download mods from the official ModHub, and check updates from ModHub or GitHub releases. Launch through Steam + Proton. Your library and setups are stored locally; searches and downloads run when requested, and automatic update checks can be disabled in Preferences.", "detail", True), False, False, 0)
         page.pack_start(label("This is an independent, unofficial application inspired by FarmSim Hub by The FarmSim Guy. It is not an official port, and it is not affiliated with or endorsed by The FarmSim Guy or GIANTS Software. It uses its own code and interface.", "muted", True), False, False, 0)
         link = Gtk.LinkButton.new_with_label("https://thefarmsimguy.com/game-creator", "The original FarmSim Hub by The FarmSim Guy")
         link.set_halign(Gtk.Align.START)

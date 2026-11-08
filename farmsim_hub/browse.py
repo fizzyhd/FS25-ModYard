@@ -15,7 +15,7 @@ class ModBrowser(Gtk.Box):
         self.owner = owner
         self.result = None
         self.pack_start(text("Find FS25 mods", "title"), False, False, 0)
-        description = text("Search the official ModHub, view mod details, and download ZIPs into your library.", "subtitle")
+        description = text("Search the official ModHub, view mod details, and download ZIPs into your FS25 mod folder. Gameplay & scripts uses ModHub’s Gameplay category.", "subtitle")
         description.set_line_wrap(True)
         self.pack_start(description, False, False, 0)
         controls = row(8)
