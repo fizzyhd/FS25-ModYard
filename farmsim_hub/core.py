@@ -271,6 +271,7 @@ class Hub:
         self.profile = Path(self.config.get("profile", profiles[0] if profiles else ""))
         self._migrate_profile_mod_directory()
         self.mods: dict[str, dict] = {}
+        self.mod_variants: dict[str, list[dict]] = {}
         self.saves: list[dict] = []
         self.duplicates: list[dict] = []
         self.scan_errors: list[str] = []
@@ -301,6 +302,16 @@ class Hub:
     def main_mod_directory(self) -> Path:
         """Return the selected FS25 profile's actual mod folder."""
         return self.profile / "mods"
+
+    def main_mods(self):
+        """Return only the installed mod copies in FS25's main mod folder."""
+        main = self.main_mod_directory().resolve()
+        return {
+            name: mod
+            for name, variants in self.mod_variants.items()
+            for mod in variants
+            if Path(mod["path"]).resolve().parent == main
+        }
 
     def active_applied_directory(self):
         """Return ModYard's current loadout folder when it is still available."""
@@ -496,7 +507,10 @@ class Hub:
                 staged.append((path, destination))
 
             names = set(impact["names"])
-            loadouts = [{**loadout, "mods": [name for name in loadout.get("mods", []) if name not in names]}
+            loadouts = [{**loadout,
+                         "mods": [name for name in loadout.get("mods", []) if name not in names],
+                         "mod_sources": {name: path for name, path in loadout.get("mod_sources", {}).items()
+                                         if name not in names}}
                         for loadout in self.config["loadouts"]]
             collections = [{**collection, "mods": [name for name in collection.get("mods", []) if name not in names]}
                            for collection in self.config["collections"]]
@@ -523,7 +537,7 @@ class Hub:
         self.saves = list_saves(self.profile)
         cache = read_json(self.cache_path, {})
         game_data = [p / "steamapps/common/Farming Simulator 25/data" for p in steam_libraries(self.home)]
-        mods, duplicates, errors = {}, [], []
+        mods, variants, duplicates, errors = {}, {}, [], []
         files = []
         for directory in self.mod_directories():
             try:
@@ -545,6 +559,7 @@ class Hub:
                 if info is None or "icon" not in info or info.get("fingerprint") != fp or not category_cache_valid(info):
                     info = mod_info(path, game_data)
                 cache[key] = info
+                variants.setdefault(path.name, []).append(info)
                 previous = mods.get(path.name)
                 if previous and previous["path"] != key:
                     duplicates.append({"name": path.name, "used": previous["path"], "other": key})
@@ -554,9 +569,77 @@ class Hub:
                 errors.append(f"{path.name}: {exc}")
             if progress and i % 40 == 0:
                 progress(f"Reading mods {i + 1} / {len(files)}…")
-        self.mods, self.duplicates, self.scan_errors = mods, duplicates, errors
+        self.mods, self.mod_variants, self.duplicates, self.scan_errors = mods, variants, duplicates, errors
         write_json(self.cache_path, cache)
         self.seed_loadouts()
+
+    def mod_for_loadout(self, name, loadout=None):
+        """Return a loadout's explicit copy, preferred-folder copy, or default copy."""
+        variants = self.mod_variants.get(name, [])
+        selected_path = (loadout or {}).get("mod_sources", {}).get(name)
+        selected = next((mod for mod in variants if mod["path"] == selected_path), None)
+        if selected:
+            return selected
+        preferred = (loadout or {}).get("mod_source_folder")
+        if preferred:
+            preferred = str(Path(preferred).expanduser().resolve())
+            selected = next((mod for mod in variants if str(Path(mod["path"]).parent) == preferred), None)
+            if selected:
+                return selected
+        return self.mods.get(name)
+
+    def set_loadout_mod_folder(self, loadout, folder=None):
+        """Prefer one source folder and add its valid mods to this loadout."""
+        if folder:
+            folder = str(Path(folder).expanduser().resolve())
+            if Path(folder) not in self.mod_directories():
+                raise HubError("Add this folder as a mod source before selecting it for a loadout.")
+            loadout["mod_source_folder"] = folder
+            loadout["mod_sources"] = {}
+            return self.add_mods_from_loadout_folder(loadout)
+        else:
+            loadout.pop("mod_source_folder", None)
+            loadout["mod_sources"] = {}
+        self.save_config()
+        return {"added": [], "folder_mods": 0, "missing": set()}
+
+    def add_mods_from_loadout_folder(self, loadout):
+        """Add every valid mod in a loadout's preferred folder, plus dependencies."""
+        folder = loadout.get("mod_source_folder")
+        if not folder:
+            raise HubError("Choose a preferred mod folder first.")
+        folder = Path(folder).expanduser().resolve()
+        folder_names = {name for name, variants in self.mod_variants.items()
+                        if any(Path(mod["path"]).parent == folder and not mod["error"] for mod in variants)}
+        before = set(loadout.get("mods", []))
+        missing = self.set_selection(loadout, before | folder_names)
+        return {"added": sorted(set(loadout["mods"]) - before),
+                "folder_mods": len(folder_names), "missing": missing}
+
+    def mod_folder_coverage(self, loadout):
+        folder = loadout.get("mod_source_folder")
+        if not folder:
+            return None
+        folder = Path(folder).expanduser().resolve()
+        names = set(loadout.get("mods", []))
+        selected = [self.mod_for_loadout(name, loadout) for name in names]
+        found = sum(bool(mod and Path(mod["path"]).parent == folder) for mod in selected)
+        return found, len(names)
+
+    def set_mod_source(self, loadout, name, path):
+        """Remember which scanned source copy a loadout should use for one mod."""
+        if not any(mod["path"] == path for mod in self.mod_variants.get(name, [])):
+            raise HubError("That mod source is no longer available. Rescan the library and try again.")
+        sources = loadout.setdefault("mod_sources", {})
+        preferred = loadout.get("mod_source_folder")
+        default = (next((mod for mod in self.mod_variants.get(name, [])
+                         if str(Path(mod["path"]).parent) == str(Path(preferred).expanduser().resolve())), None)
+                   if preferred else None) or self.mods.get(name)
+        if default and default["path"] == path:
+            sources.pop(name, None)
+        else:
+            sources[name] = path
+        self.save_config()
 
     def seed_loadouts(self):
         with self.lock:
@@ -673,7 +756,7 @@ class Hub:
             loadout["dlcs"] = sorted(set(loadout["dlcs"]) | {required})
         map_mod = self.map_mod(loadout)
         if map_mod:
-            loadout["mods"] = sorted(self.dependency_closure(set(loadout["mods"]) | {map_mod})[0])
+            loadout["mods"] = sorted(self.dependency_closure(set(loadout["mods"]) | {map_mod}, loadout)[0])
         try:
             self._validate_dlcs(loadout)
             self.save_config()
@@ -700,14 +783,14 @@ class Hub:
         if unknown:
             raise HubError("Start FS25 once, then rescan so its DLC versions can be read:\n" + "\n".join(sorted(unknown)))
 
-    def dependency_closure(self, names):
+    def dependency_closure(self, names, loadout=None):
         by_stem = {Path(n).stem: n for n in self.mods}
         selected = {name if name in self.mods else by_stem.get(Path(name).stem, name) for name in names}
         missing = set()
         todo = list(selected)
         while todo:
             name = todo.pop()
-            info = self.mods.get(name)
+            info = self.mod_for_loadout(name, loadout)
             if not info:
                 missing.add(name)
                 continue
@@ -736,7 +819,7 @@ class Hub:
         required = self.map_mod(loadout)
         if required:
             names.add(required)
-        names, missing = self.dependency_closure(names)
+        names, missing = self.dependency_closure(names, loadout)
         loadout["mods"] = sorted(names)
         self.save_config()
         return missing
@@ -746,12 +829,14 @@ class Hub:
         required = self.map_mod(loadout)
         if required and required not in names:
             raise HubError("The save's map mod must stay selected.")
-        selected, missing = self.dependency_closure(names)
+        selected, missing = self.dependency_closure(names, loadout)
         if missing:
             raise HubError("Missing mods or dependencies:\n" + "\n".join(sorted(missing)))
         if selected != names:
             raise HubError("This loadout needs additional dependencies. Re-select its mods to include them.")
-        broken = [n for n in names if self.mods[n]["error"] or not Path(self.mods[n]["path"]).exists()]
+        broken = [n for n in names
+                  if self.mod_for_loadout(n, loadout)["error"] or
+                  not Path(self.mod_for_loadout(n, loadout)["path"]).exists()]
         if broken:
             raise HubError("Fix or deselect these mods before applying:\n" + "\n".join(sorted(broken)))
         if loadout.get("slot") and not self.save_for(loadout):
@@ -827,7 +912,7 @@ class Hub:
         candidate = str(value or "").replace("\\", "/").rstrip("/").casefold()
         return candidate == applied_root or candidate.startswith(applied_root + "/")
 
-    def _career_with_mods(self, save, names, progress=None, dlcs=None):
+    def _career_with_mods(self, save, names, progress=None, dlcs=None, loadout=None):
         root = read_xml((self.profile / f"savegame{save['slot']}/careerSavegame.xml").read_bytes())
         previous = {m.get("modName"): m for m in root.findall("mod")}
         for node in root.findall("mod"):
@@ -845,7 +930,7 @@ class Hub:
                         node.set(field, catalog[name][field])
                 root.append(node)
         for index, name in enumerate(sorted(names)):
-            info = self.mods[name]
+            info = self.mod_for_loadout(name, loadout)
             stem = Path(name).stem
             node = copy.deepcopy(previous.get(stem))
             needs_hash = node is None or node.get("version") != info["version"]
@@ -885,7 +970,7 @@ class Hub:
         career_path = self.profile / f"savegame{save['slot']}/careerSavegame.xml" if save else None
         old_career = career_path.read_bytes() if career_path else None
         dlcs = self.selected_dlcs(loadout) if "dlcs" in loadout else None
-        new_career = self._career_with_mods(save, names, progress, dlcs) if save else None
+        new_career = self._career_with_mods(save, names, progress, dlcs, loadout) if save else None
         require_game_closed()
         if settings_path.read_bytes() != old_settings or (career_path and career_path.read_bytes() != old_career):
             raise HubError("FS25 files changed during preparation. Refresh and try again.")
@@ -895,7 +980,8 @@ class Hub:
         applied.mkdir(parents=True)
         try:
             for name in names:
-                (applied / name).symlink_to(self.mods[name]["path"], target_is_directory=Path(self.mods[name]["path"]).is_dir())
+                mod = self.mod_for_loadout(name, loadout)
+                (applied / name).symlink_to(mod["path"], target_is_directory=Path(mod["path"]).is_dir())
             if any(not p.exists() for p in applied.iterdir()):
                 raise HubError("A mod source disappeared while preparing the loadout. Refresh and try again.")
             require_game_closed()

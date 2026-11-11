@@ -303,11 +303,12 @@ class Window(Gtk.Window):
         return False
 
     def _start_startup_update_check(self):
-        if not self.hub.config.get("auto_check_updates", True) or not self.hub.mods:
+        main_mods = self.hub.main_mods()
+        if not self.hub.config.get("auto_check_updates", True) or not main_mods:
             return
         now = datetime.now(timezone.utc)
         stale = []
-        for name, mod in self.hub.mods.items():
+        for name, mod in main_mods.items():
             entry = self.modhub.cache["entries"].get(name, {})
             try:
                 checked = datetime.fromisoformat(entry.get("checked_at", "")).replace(tzinfo=timezone.utc)
@@ -329,7 +330,7 @@ class Window(Gtk.Window):
             if error:
                 self.toast("Automatic update check stopped: " + str(error).splitlines()[0])
             else:
-                available = sum(item["status"] == "Update available" for item in self.modhub.results(self.hub.mods))
+                available = sum(item["status"] == "Update available" for item in self.modhub.results(self.hub.main_mods()))
                 self.toast(f"Automatic update check complete · {available} updates available")
 
         def worker():
@@ -517,6 +518,18 @@ class Window(Gtk.Window):
             self._populate_mods()
             self._render_dlcs()
 
+    def choose_mod_version(self, name, path):
+        if not self.current or not path:
+            return
+        try:
+            self.hub.set_mod_source(self.current, name, path)
+        except HubError as exc:
+            self.notice(exc)
+            return
+        self._populate_mods()
+        selected = self.hub.mod_for_loadout(name, self.current)
+        self.toast(f"{name}: selected v{selected['version'] or 'unknown'} from {Path(selected['path']).parent}")
+
     def choose_loadout(self, loadout):
         self.loadout_combo.set_active_id(loadout["id"])
         self.go("Mod library")
@@ -528,7 +541,7 @@ class Window(Gtk.Window):
         favourites = set(self.hub.config["favorites"])
         names = set(self.hub.mods) | selected
         for name in sorted(names, key=lambda n: self.hub.mods.get(n, {}).get("title", n).casefold()):
-            mod = self.hub.mods.get(name)
+            mod = self.hub.mod_for_loadout(name, self.current)
             if mod:
                 self.model.append([name in selected, name in favourites, mod["title"], mod["kind"], mod["version"],
                                    mod["author"], size_text(mod["size"]), name, self.pictures.thumbnails.get(name, self.placeholder)])
@@ -557,7 +570,7 @@ class Window(Gtk.Window):
         self.library.launch_button.set_sensitive(self.current is not None)
         self.library.launch_all_button.set_sensitive((self.hub.profile / "gameSettings.xml").is_file())
         names = self.current["mods"] if self.current else []
-        missing_dependencies = self.hub.dependency_closure(names)[1] if self.current else set()
+        missing_dependencies = self.hub.dependency_closure(names, self.current)[1] if self.current else set()
         self.library.dependencies_item.set_sensitive(bool(missing_dependencies))
         missing = sum(n not in self.hub.mods for n in names)
         highlighted = len(self.library.highlighted_names())
@@ -594,7 +607,7 @@ class Window(Gtk.Window):
         if not self.current:
             self.notice("Choose a loadout first.")
             return
-        missing = set(missing or self.hub.dependency_closure(self.current["mods"])[1])
+        missing = set(missing or self.hub.dependency_closure(self.current["mods"], self.current)[1])
         if not missing:
             self.toast("This loadout has no missing mod dependencies.")
             return
@@ -616,7 +629,7 @@ class Window(Gtk.Window):
                 if not found:
                     break
                 self._scan_library(progress)
-                closure, pending = self.hub.dependency_closure(self.current["mods"])
+                closure, pending = self.hub.dependency_closure(self.current["mods"], self.current)
                 self.hub.set_selection(self.current, closure)
             unresolved = sorted(set(pending) | {name[:-4] for name in failure_map
                                                 if name not in self.hub.mods and name[:-4] not in self.hub.mods})
@@ -733,6 +746,10 @@ class Window(Gtk.Window):
         name, slot = self.name_dialog("Clone loadout" if clone else "New loadout", with_slot=True)
         if name:
             loadout = self.hub.new_loadout(name, self.current["mods"] if clone and self.current else [], slot)
+            if clone and self.current:
+                loadout["mod_sources"] = copy.deepcopy(self.current.get("mod_sources", {}))
+                if self.current.get("mod_source_folder"):
+                    loadout["mod_source_folder"] = self.current["mod_source_folder"]
             if clone and self.current and "dlcs" in self.current:
                 loadout["dlcs"] = list(self.current["dlcs"])
             self.hub.set_selection(loadout, loadout["mods"])
@@ -909,7 +926,7 @@ class Window(Gtk.Window):
                 raise HubError("Close FS25 before applying or launching a loadout.")
             self.hub.validate_loadout(target)
         except HubError as exc:
-            missing = self.hub.dependency_closure(target["mods"])[1]
+            missing = self.hub.dependency_closure(target["mods"], target)[1]
             if missing and not game_running():
                 self.find_missing_dependencies(missing)
                 return
@@ -936,11 +953,15 @@ class Window(Gtk.Window):
                 text += "Choose this loadout's DLCs in-game, or link it to a save under DLC choices to apply those selections.\n\n"
         text += "Your library and existing mod-switcher profiles stay in place."
         selected_names = set(target["mods"])
-        duplicate_mods = [duplicate for duplicate in self.hub.duplicates if duplicate.get("name") in selected_names]
-        if duplicate_mods:
-            duplicate_names = sorted({duplicate["name"] for duplicate in duplicate_mods})
-            text += ("\n\nWarning: duplicate copies of these selected mods were found. ModYard will use the first scanned copy and ignore the others:\n" +
-                     "\n".join(duplicate_names[:8]) + (f"\n…and {len(duplicate_names) - 8} more" if len(duplicate_names) > 8 else ""))
+        duplicate_names = sorted(name for name in selected_names if len(self.hub.mod_variants.get(name, [])) > 1)
+        if duplicate_names:
+            choices = []
+            for name in duplicate_names[:8]:
+                mod = self.hub.mod_for_loadout(name, target)
+                choices.append(f"{name}: v{mod['version'] or 'unknown'} · {Path(mod['path']).parent}")
+            text += "\n\nSelected source versions:\n" + "\n".join(choices)
+            if len(duplicate_names) > 8:
+                text += f"\n…and {len(duplicate_names) - 8} more"
         if not self.confirm("Apply and launch FS25?" if launch else "Apply this loadout?", text):
             return
         loadout = copy.deepcopy(target)
@@ -1183,6 +1204,55 @@ class Window(Gtk.Window):
             self._update_selection(names | members if enabled else names - members)
             self.go("Mod library")
 
+    def loadout_mod_folder_changed(self, loadout, folder_id):
+        try:
+            result = self.hub.set_loadout_mod_folder(loadout, None if folder_id == "any" else folder_id)
+        except (HubError, OSError) as exc:
+            self.notice(exc)
+            self._render_loadouts()
+            return
+        if self.current and self.current["id"] == loadout["id"]:
+            self._populate_mods()
+        self._render_loadouts()
+        if loadout.get("mod_source_folder"):
+            self.toast(f"Added {len(result['added'])} mods to {loadout['name']} · {result['folder_mods']} valid mods found in folder")
+            if result["missing"]:
+                self.notice("Missing dependencies:\n" + "\n".join(sorted(result["missing"])))
+        else:
+            self.toast(f"Cleared the preferred mod folder for {loadout['name']}")
+
+    def choose_loadout_mod_folder(self, loadout):
+        folder = self.folder_dialog(f"Choose a mod source folder for {loadout['name']}")
+        if not folder:
+            return
+
+        def work(progress):
+            if folder.resolve() not in self.hub.mod_directories():
+                self.hub.add_mod_source(folder)
+            self._scan_library(progress)
+            return self.hub.set_loadout_mod_folder(loadout, folder)
+
+        def finished(result):
+            self.loaded()
+            self.toast(f"Added {len(result['added'])} mods to {loadout['name']} · {result['folder_mods']} valid mods found in folder")
+            if result["missing"]:
+                self.notice("Missing dependencies:\n" + "\n".join(sorted(result["missing"])))
+
+        self._run(work, finished, "Scanning the selected mod folder…")
+
+    def add_loadout_folder_mods(self, loadout):
+        try:
+            result = self.hub.add_mods_from_loadout_folder(loadout)
+        except (HubError, OSError) as exc:
+            self.notice(exc)
+            return
+        if self.current and self.current["id"] == loadout["id"]:
+            self._populate_mods()
+        self._render_loadouts()
+        self.toast(f"Added {len(result['added'])} mods to {loadout['name']} · {result['folder_mods']} valid mods found in folder")
+        if result["missing"]:
+            self.notice("Missing dependencies:\n" + "\n".join(sorted(result["missing"])))
+
     def _render_loadouts(self):
         page, content = self._replace_page("Loadouts", "A setup for every farm", "Choose mods and DLCs, export a server bundle, or manage your saved setups.")
         actions = box(False, 10)
@@ -1199,6 +1269,27 @@ class Window(Gtk.Window):
             info.pack_start(label(loadout["name"], wrap=True), False, False, 0)
             slot = f"Save {loadout['slot']}" if loadout.get("slot") else "Independent loadout"
             info.pack_start(label(f"{len(loadout['mods'])} mods · {len(self.hub.selected_dlcs(loadout))} DLCs · {slot}", "muted"), False, False, 0)
+            source = Gtk.ComboBoxText()
+            source.set_size_request(300, -1)
+            source.append("any", "Use per-mod source choices")
+            folders = list(self.hub.mod_directories())
+            preferred = loadout.get("mod_source_folder")
+            if preferred and Path(preferred) not in folders:
+                folders.append(Path(preferred))
+            for folder in folders:
+                resolved = str(folder.resolve())
+                source.append(resolved, f"{folder.name} · {folder.parent.name}")
+            source.set_active_id(preferred or "any")
+            source.set_tooltip_text("Prefer mod copies from this folder for the entire loadout\n" +
+                                    (preferred or "Without a preferred folder, each mod uses its selected or first scanned copy."))
+            source.connect("changed", lambda combo, l=loadout: self.loadout_mod_folder_changed(l, combo.get_active_id()))
+            info.pack_start(source, False, False, 0)
+            if preferred:
+                coverage = self.hub.mod_folder_coverage(loadout)
+                found, total = coverage or (0, len(loadout["mods"]))
+                info.pack_start(label(f"Preferred folder is supplying {found} of {total} selected mods; other copies are fallback. Selecting a folder adds its valid mods to this loadout.", "muted", True), False, False, 0)
+                info.pack_start(button("Add folder mods to loadout", lambda l=loadout: self.add_loadout_folder_mods(l)), False, False, 0)
+            info.pack_start(button("Choose folder…", lambda l=loadout: self.choose_loadout_mod_folder(l)), False, False, 0)
             row.pack_start(info, False, False, 0)
             controls = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=6, row_spacing=6)
             controls.set_min_children_per_line(1)
@@ -1322,15 +1413,16 @@ class Window(Gtk.Window):
             self._render_loadouts()
 
     def _render_updates(self):
-        results = self.modhub.results(self.hub.mods)
+        main_mods = self.hub.main_mods()
+        results = self.modhub.results(main_mods)
         updates = sum(r["status"] == "Update available" for r in results)
         matched = sum(bool(r.get("id") or r.get("repo")) and not r.get("error") for r in results)
         unmatched = sum(r["status"] == "No exact match" for r in results)
         page, content = self._replace_page("Mod updates", "ModHub and GitHub updates",
-                                          f"{updates} updates available · {matched} matched · {unmatched} without an exact match · {len(self.hub.mods) - len(results)} unchecked")
+                                          f"{updates} updates available · {matched} matched · {unmatched} without an exact match · {len(main_mods) - len(results)} unchecked in main mod folder")
         actions = box(False, 8)
         actions.pack_start(button("Quick check current loadout", lambda: self.check_mod_updates(True)), False, False, 0)
-        actions.pack_start(button("Quick check all mods", self.check_mod_updates, True), False, False, 0)
+        actions.pack_start(button("Quick check main mod folder", self.check_mod_updates), False, False, 0)
         actions.pack_start(button("Force refresh current loadout", lambda: self.check_mod_updates(True, force=True)), False, False, 0)
         actions.pack_start(button("Download all available updates", self.install_all_mod_updates, True), False, False, 0)
         actions.pack_start(button("Open mod backups", lambda: self.open_folder(self.hub.data / "mod-backups")), False, False, 0)
@@ -1415,8 +1507,9 @@ class Window(Gtk.Window):
         if current_only and not self.current:
             self.notice("Choose a loadout first.")
             return
-        names = set(self.current["mods"]) if current_only else set(self.hub.mods)
-        mods = [copy.deepcopy(self.hub.mods[n]) for n in sorted(names) if n in self.hub.mods]
+        main_mods = self.hub.main_mods()
+        names = set(self.current["mods"]) if current_only else set(main_mods)
+        mods = [copy.deepcopy(main_mods[n]) for n in sorted(names) if n in main_mods]
         if not mods:
             self.notice("There are no installed mods in this selection to check.")
             return
@@ -1445,7 +1538,7 @@ class Window(Gtk.Window):
         url = entry.get_text().strip()
         dialog.destroy()
         if response == Gtk.ResponseType.OK and url:
-            mod = copy.deepcopy(self.hub.mods[name])
+            mod = copy.deepcopy(self.hub.main_mods()[name])
             self._run(lambda _: self.modhub.link(mod, url), lambda _: self._updates_finished(), "Verifying the mod update source…")
 
     def install_mod_update(self, result):
@@ -1479,7 +1572,7 @@ class Window(Gtk.Window):
         if game_running():
             self.notice("Close FS25 before replacing mods.")
             return
-        updates = [result for result in self.modhub.results(self.hub.mods) if result["can_update"]]
+        updates = [result for result in self.modhub.results(self.hub.main_mods()) if result["can_update"]]
         if not updates:
             self.notice("No verified updates are ready to install. Check for updates first.")
             return
@@ -1555,7 +1648,11 @@ class Window(Gtk.Window):
                     if self.startup_update_check_running:
                         self.notice("Wait for the automatic update check to finish before starting another check.")
                         return
-                    self._run(lambda progress: self.modhub.check_mods([copy.deepcopy(installed)], progress, force=True), lambda _: self._updates_finished(), "Checking the installed mod…")
+                    main_installed = self.hub.main_mods().get(installed["name"])
+                    if not main_installed:
+                        self.notice("Mod updates only check ZIPs in the main FS25 mod folder.")
+                        return
+                    self._run(lambda progress: self.modhub.check_mods([copy.deepcopy(main_installed)], progress, force=True), lambda _: self._updates_finished(), "Checking the installed mod…")
                 else:
                     self.download_modhub_mod(entry["id"])
         self._run(lambda _: self.modhub.detail(item["id"]), details, "Loading ModHub details…")
@@ -1668,7 +1765,7 @@ class Window(Gtk.Window):
             self.sources_list.pack_start(label("No mod sources found"), False, False, 0)
         text = f"App data: {self.hub.data}\nFS25 mod folder: {self.hub.main_mod_directory()}"
         if self.hub.duplicates:
-            text += f"\n{len(self.hub.duplicates)} duplicate filenames found; the first source is used."
+            text += f"\n{len(self.hub.duplicates)} mods have copies in multiple source folders; choose a version on its library card for each loadout."
         if self.hub.scan_errors:
             text += "\n" + "\n".join(self.hub.scan_errors[:3])
         self.diagnostics.set_text(text)

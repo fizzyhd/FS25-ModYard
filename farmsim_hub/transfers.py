@@ -20,7 +20,8 @@ def file_stamp(path):
 
 def export_loadout(hub, loadout, destination, progress=None):
     destination = Path(destination).expanduser().resolve()
-    for mod in hub.mods.values():
+    variants = [mod for copies in hub.mod_variants.values() for mod in copies] or list(hub.mods.values())
+    for mod in variants:
         source = Path(mod["path"]).resolve()
         if destination == source or (source.is_dir() and destination.is_relative_to(source)):
             raise HubError("Choose an export location outside your source mod files.")
@@ -28,14 +29,14 @@ def export_loadout(hub, loadout, destination, progress=None):
     required = hub.map_mod(loadout)
     if required:
         names.add(required)
-    names, missing = hub.dependency_closure(names)
+    names, missing = hub.dependency_closure(names, loadout)
     if missing:
         raise HubError("This loadout cannot be exported completely. Missing mods or dependencies:\n" + "\n".join(sorted(missing)))
     if not names:
         raise HubError("Select some mods before exporting this loadout.")
     sources, output_names = [], set()
     for name in sorted(names):
-        info = hub.mods[name]
+        info = hub.mod_for_loadout(name, loadout)
         path = Path(info["path"])
         if info["error"] or not path.exists() or not valid_mod_name(name):
             raise HubError(f"Cannot export {name}: {info['error'] or 'source is missing or invalid'}")

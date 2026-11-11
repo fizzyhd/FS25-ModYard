@@ -548,7 +548,7 @@ class ModHubClient:
 
     def install_update(self, hub, name, progress=None):
         require_game_closed()
-        mod = hub.mods.get(name)
+        mod = hub.main_mods().get(name)
         entry = self.cache["entries"].get(name, {})
         if not mod or not (entry.get("id") or entry.get("repo")) or not name.lower().endswith(".zip") or not Path(mod["path"]).is_file():
             raise HubError("Check this ZIP mod's update source before updating it.")

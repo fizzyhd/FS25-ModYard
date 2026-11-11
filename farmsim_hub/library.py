@@ -1,5 +1,7 @@
 """Responsive native card browser for the mod library."""
 
+from pathlib import Path
+
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Pango
@@ -93,10 +95,10 @@ class ModCard(Gtk.FlowBoxChild):
         self.browser, self.mod_name = browser, name
         self.set_halign(Gtk.Align.START)
         self.set_valign(Gtk.Align.START)
-        self.set_size_request(156, 236)
+        self.set_size_request(156, 268)
         self.get_style_context().add_class("mod-card")
         owner = browser.owner
-        mod = owner.hub.mods.get(name)
+        mod = owner.hub.mod_for_loadout(name, owner.current)
         title = mod["title"] if mod else name
         kind = mod["kind"] if mod else "Missing"
         categories = mod.get("categories", [kind]) if mod else ["Missing"]
@@ -142,13 +144,31 @@ class ModCard(Gtk.FlowBoxChild):
         author.set_max_width_chars(16)
         author.set_ellipsize(Pango.EllipsizeMode.END)
         information.pack_start(author, False, False, 0)
-        information.pack_start(text("v" + mod["version"] if mod and mod["version"] else "—", "mod-version"), False, False, 0)
+        version = text("v" + mod["version"] if mod and mod["version"] else "—", "mod-version")
+        information.pack_start(version, False, False, 0)
+        variants = owner.hub.mod_variants.get(name, [])
+        if len(variants) > 1:
+            self.source_combo = Gtk.ComboBoxText()
+            self.source_combo.set_size_request(132, -1)
+            self.source_combo.set_tooltip_text("Choose which source-folder copy this loadout uses")
+            selected_path = mod["path"] if mod else ""
+            for variant in variants:
+                source = Path(variant["path"])
+                version_text = "v" + variant["version"] if variant["version"] else "Unknown version"
+                self.source_combo.append(variant["path"], f"{version_text} · {source.parent.name}")
+            self.source_combo.set_active_id(selected_path)
+            self.source_combo.connect("changed", lambda combo: owner.choose_mod_version(name, combo.get_active_id()))
+            self.source_combo.set_tooltip_text("Choose the version and source folder for this loadout\n" +
+                                               "\n".join(variant["path"] for variant in variants))
+            information.pack_start(self.source_combo, False, False, 0)
         contents.pack_start(information, False, False, 0)
         if mod is None:
             self.get_style_context().add_class("missing")
 
     def update(self, enabled, favourite):
         self.enabled.set_sensitive(self.browser.owner.current is not None)
+        if hasattr(self, "source_combo"):
+            self.source_combo.set_sensitive(self.browser.owner.current is not None)
         for control, signal, value in [(self.enabled, self.enabled_signal, enabled),
                                        (self.favourite, self.favourite_signal, favourite)]:
             control.handler_block(signal)
