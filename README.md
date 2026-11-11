@@ -18,48 +18,19 @@ FS25 ModYard runs natively on Linux and works with the Steam version of Farming 
 
 ## Install
 
-### From a GitHub release
+### Install or update with one command
 
-1. Open [this repository's Releases page](../../releases/latest) and download the latest `fs25-modyard-*.tar.gz` bundle and its `.sha256` checksum file.
-2. In the download folder, verify the bundle:
+Open Konsole and paste:
 
-   ```sh
-   sha256sum -c fs25-modyard-*.tar.gz.sha256
-   ```
-
-3. Extract the bundle and run the installer:
-
-   ```sh
-   tar -xzf fs25-modyard-*.tar.gz
-   cd fs25-modyard-*/
-   ./install.sh --install-deps
-   ```
-
-The installer checks for **Python 3.10 or newer**, **GTK 3**, and **PyGObject**. `--install-deps` installs missing packages through apt on Debian/Ubuntu, dnf on Fedora, pacman on Arch Linux, or zypper on openSUSE; it asks for your password through `sudo` when needed. Without that option, `./install.sh` asks before installing. Review the package list shown by the installer. To manage dependencies yourself, install the packages below and run `./install.sh --no-deps`.
-
-### Upgrade from an earlier version
-
-Close FS25 ModYard, download and extract the latest release bundle, then run the same installer from its extracted folder. It replaces the app files and launcher while keeping your mods, loadouts, collections, settings, and backups in `~/.local/share/fs25-modyard/`. You do not need to uninstall first. Do not use `uninstall.sh --purge-data` when upgrading; that removes your saved data.
-
-To download and install the latest release directly from a terminal, set `version` to the latest release number shown on the [Releases page](../../releases/latest) (currently `0.6.5`) and run:
-
-```bash
-set -euo pipefail
-version=0.6.5
-tmpdir="$(mktemp -d)"
-trap 'rm -rf -- "$tmpdir"' EXIT
-base="https://github.com/fizzyhd/FS25-ModYard/releases/latest/download"
-archive="fs25-modyard-${version}.tar.gz"
-
-curl -fL "$base/$archive" -o "$tmpdir/$archive"
-curl -fL "$base/$archive.sha256" -o "$tmpdir/$archive.sha256"
-(cd "$tmpdir" && sha256sum -c "$archive.sha256")
-tar -xzf "$tmpdir/$archive" -C "$tmpdir"
-cd "$tmpdir/fs25-modyard-$version"
-./install.sh --install-deps
+```sh
+curl -fL https://raw.githubusercontent.com/fizzyhd/FS25-ModYard/main/install-latest.sh -o /tmp/fs25-modyard-install.sh && bash /tmp/fs25-modyard-install.sh
 ```
 
-The installer checks and installs missing system dependencies for supported distributions. It may ask for your `sudo` password; the app itself installs in your home directory.
+The installer finds the latest stable release, downloads its bundle and checksum, verifies the download, and installs the app and desktop shortcut in your home folder. It keeps your mods, loadouts, collections, settings, and backups when updating. You do not need to set a version number or uninstall first.
+
+On SteamOS, it avoids trying to install system packages because the system partition is read-only. On supported desktop Linux distributions, it installs missing dependencies with the system package manager and may ask for your `sudo` password. The app itself does not need root access. To inspect the script before running it, [view install-latest.sh](https://github.com/fizzyhd/FS25-ModYard/blob/main/install-latest.sh).
+
+The installer needs Python 3, GTK 3, and PyGObject. Steam Deck users should switch to Desktop Mode before installing, then launch **FS25 ModYard** from the application menu.
 
 | Distribution family | Packages |
 | --- | --- |
@@ -70,7 +41,7 @@ The installer checks and installs missing system dependencies for supported dist
 
 The app and desktop shortcut install in your home directory; root access is not needed to install the app itself. After installation, open **FS25 ModYard** from your application menu. On first launch, check **Settings** if your FS25 Steam or Proton folders are not detected automatically.
 
-To uninstall while keeping your settings, loadouts, collections, and backups, run `./uninstall.sh` from the extracted bundle. Add `--purge-data` only if you also want to delete the app's data directory.
+To uninstall while keeping your settings, loadouts, collections, and backups, run `./uninstall.sh` from a downloaded bundle. Add `--purge-data` only if you also want to delete the app's data directory.
 
 ### Run from source
 
