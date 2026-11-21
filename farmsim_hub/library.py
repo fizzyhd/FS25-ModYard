@@ -161,19 +161,33 @@ class ModCard(Gtk.FlowBoxChild):
             self.source_combo.set_tooltip_text("Choose the version and source folder for this loadout\n" +
                                                "\n".join(variant["path"] for variant in variants))
             information.pack_start(self.source_combo, False, False, 0)
+        self.pin_button = Gtk.ToggleButton(label="Pin version")
+        self.pin_signal = self.pin_button.connect("toggled", lambda button: owner.toggle_mod_pin(name, button.get_active()))
+        information.pack_start(self.pin_button, False, False, 0)
         contents.pack_start(information, False, False, 0)
         if mod is None:
             self.get_style_context().add_class("missing")
 
     def update(self, enabled, favourite):
-        self.enabled.set_sensitive(self.browser.owner.current is not None)
+        owner = self.browser.owner
+        self.enabled.set_sensitive(owner.current is not None)
         if hasattr(self, "source_combo"):
-            self.source_combo.set_sensitive(self.browser.owner.current is not None)
+            self.source_combo.set_sensitive(owner.current is not None)
         for control, signal, value in [(self.enabled, self.enabled_signal, enabled),
                                        (self.favourite, self.favourite_signal, favourite)]:
             control.handler_block(signal)
             control.set_active(value)
             control.handler_unblock(signal)
+        pin = owner.hub.pinned_mod_for_loadout(owner.current, self.mod_name)
+        self.pin_button.handler_block(self.pin_signal)
+        self.pin_button.set_active(pin is not None)
+        self.pin_button.set_label(f"Pinned v{pin.get('version') or 'unknown'}" if pin else "Pin version")
+        self.pin_button.handler_unblock(self.pin_signal)
+        self.pin_button.set_sensitive(bool(owner.current and enabled and owner.hub.mod_for_loadout(self.mod_name, owner.current)))
+        self.pin_button.set_visible(bool(owner.current and enabled))
+        self.pin_button.set_tooltip_text(
+            f"Keep v{pin.get('version') or 'unknown'} in this loadout. ModYard blocks updates to this file."
+            if pin else "Pin the selected copy for this loadout. ModYard blocks updates to this file.")
         context = self.get_style_context()
         (context.add_class if enabled else context.remove_class)("enabled")
         (context.add_class if favourite else context.remove_class)("favourited")

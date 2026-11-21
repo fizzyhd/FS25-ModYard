@@ -14,7 +14,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 
 from . import __version__
-from .core import Hub, HubError, SETTING_FIELDS, detect_profiles, game_running
+from .core import Hub, HubError, SETTING_FIELDS, detect_profiles, game_running, mod_info
 from .pictures import ModPictures, THUMBNAIL_SIZE
 from .library import LibraryBrowser, LIBRARY_CSS, action, icon
 from .modhub import BASE, ModHubClient
@@ -681,6 +681,24 @@ class Window(Gtk.Window):
         if name not in names and name in self.current["mods"]:
             self.toast("That mod is required by another selected mod and stays in this loadout.")
 
+    def toggle_mod_pin(self, name, pinned):
+        if not self.current:
+            return
+        try:
+            self.hub.set_mod_pinned(self.current, name, pinned)
+        except (HubError, OSError) as exc:
+            self.notice(exc)
+            self._populate_mods()
+            return
+        mod = self.hub.mod_for_loadout(name, self.current)
+        loadout_name = self.current["name"]
+        self._populate_mods()
+        if pinned:
+            self.toast(f"Pinned {name} v{mod['version'] or 'unknown'} in {loadout_name}")
+        else:
+            self.toast(f"Unpinned {name} in {loadout_name}")
+        self._render_updates()
+
 
     def select_shown(self, enabled):
         if self.current:
@@ -689,31 +707,149 @@ class Window(Gtk.Window):
             self._update_selection(names | visible if enabled else names - visible)
 
     def show_mod_details(self, name):
-        mod = self.hub.mods.get(name)
+        mod = self.hub.mod_for_loadout(name, self.current)
         if not mod:
             self.notice(f"{name} is referenced by this loadout but is missing from your mod folders.")
             return
+        if "description" not in mod:
+            mod.update(mod_info(Path(mod["path"])))
+        cached = self.modhub.cache["entries"].get(name, {})
+        self._show_mod_details_dialog(name, mod, cached if cached.get("id") else None)
+
+    def _show_mod_details_dialog(self, name, mod, modhub_entry=None, lookup_error=""):
         dialog = Gtk.Dialog(title=mod["title"], transient_for=self, modal=True)
+        remove_button = dialog.add_button("Remove", 1)
+        remove_button.get_style_context().add_class("destructive-action")
+        update_button = dialog.add_button("Update", 2)
+        check_button = dialog.add_button("Check for updates", 3)
         dialog.add_buttons("Close", Gtk.ResponseType.CLOSE)
-        dialog.set_default_size(530, 300)
-        content = box(False, 20, 22)
+        main_mod = self.hub.main_mods().get(name)
+        main_copy = bool(main_mod and main_mod["path"] == mod["path"])
+        result = next(iter(self.modhub.results({name: main_mod})), None) if main_copy else None
+        pinned = self.hub.pinned_loadouts_for_mod(name, mod["path"])
+        can_work = not self.busy and not self.startup_update_check_running
+        remove_button.set_sensitive(not self.busy)
+        remove_button.set_tooltip_text("Remove this mod and its copies from mod folders, loadouts and collections. Confirmation required.")
+        check_button.set_sensitive(main_copy and can_work)
+        check_button.set_tooltip_text("Check this mod for updates now" if main_copy else "Updates only check mods in the main FS25 mod folder.")
+        update_button.set_sensitive(bool(main_copy and can_work and result and result["can_update"] and not pinned))
+        update_button.set_tooltip_text("Unpin this version before updating." if pinned else
+                                       "Install a verified update with a backup. Check for updates first if none is available.")
+        dialog.set_default_size(600, 520)
+        content = box(False, 16, 20)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
         if name in self.pictures.images:
-            content.pack_start(Gtk.Image.new_from_pixbuf(self.pictures.images[name]), False, False, 0)
+            artwork = Gtk.Image.new_from_pixbuf(self.pictures.images[name])
+            artwork.set_valign(Gtk.Align.START)
+            content.pack_start(artwork, False, False, 0)
         info = box(spacing=9)
         info.pack_start(label(mod["title"], "title", True), False, False, 0)
         info.pack_start(label(f"{mod['author']} · v{mod['version']}", "muted", True), False, False, 0)
         info.pack_start(label(", ".join(mod.get("categories", [mod["kind"]])) + " · " + size_text(mod["size"]), wrap=True), False, False, 0)
+        if not main_copy:
+            update_status = "Updates are limited to the main FS25 mod folder. This copy is in another source folder."
+        elif result:
+            update_status = result["status"] + (f" · available version {result['version']}" if result.get("can_update") else "")
+        else:
+            update_status = "Check for updates to find a newer version."
+        if pinned:
+            update_status += " · Pinned in " + ", ".join(pinned)
+        info.pack_start(label(update_status, "muted", True), False, False, 0)
+        source = box(spacing=0)
+        info.pack_start(source, False, False, 0)
+        page_url = modhub_entry.get("url") if modhub_entry else ""
+        if page_url:
+            source.pack_start(Gtk.LinkButton.new_with_label(page_url, "Open official ModHub page"), False, False, 0)
+        elif lookup_error:
+            source.pack_start(label("ModHub details could not be loaded.", "muted", True), False, False, 0)
+        else:
+            source.pack_start(label("Looking for the official ModHub page…", "muted", True), False, False, 0)
         if mod.get("error"):
             info.pack_start(label("Needs attention: " + mod["error"], "muted", True), False, False, 0)
         info.pack_start(label("Dependencies: " + (", ".join(mod["dependencies"]) or "None"), wrap=True), False, False, 0)
         filename = label(name, "muted", True)
         filename.set_selectable(True)
         info.pack_start(filename, False, False, 0)
+        description = mod.get("description", "") or (modhub_entry or {}).get("description", "")
+        info.pack_start(label("Description", "section-label"), False, False, 0)
+        description_label = label(description or "No description is available for this mod.", wrap=True)
+        description_label.set_selectable(True)
+        description_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        description_label.set_xalign(0)
+        info.pack_start(description_label, False, False, 0)
         content.pack_start(info, True, True, 0)
-        dialog.get_content_area().pack_start(content, True, True, 0)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(content)
+        dialog.get_content_area().pack_start(scroller, True, True, 0)
+        alive = [True]
+        dialog.connect("destroy", lambda *_: alive.__setitem__(0, False))
+
+        def show_source(result):
+            if not alive[0]:
+                return False
+            entry, error = result
+            for child in source.get_children():
+                child.destroy()
+            if entry and entry.get("url"):
+                source.pack_start(Gtk.LinkButton.new_with_label(entry["url"], "Open official ModHub page"), False, False, 0)
+                if not description and entry.get("description"):
+                    description_label.set_text(entry["description"])
+            else:
+                source.pack_start(label("ModHub details could not be loaded." if error else
+                                        "No exact official ModHub page was found for this ZIP.", "muted", True), False, False, 0)
+            source.show_all()
+            return False
+
+        if not page_url and not lookup_error:
+            if not hasattr(self, "_mod_details_results"):
+                self._mod_details_results = {}
+            if name in self._mod_details_results:
+                show_source(self._mod_details_results[name])
+            else:
+                def lookup():
+                    try:
+                        result = (self.modhub.find_modhub_entry(dict(mod)), False)
+                    except Exception:
+                        result = (None, True)
+
+                    def finished():
+                        # Retry connection failures next time; keep successful lookups,
+                        # including mods with no official page, for this app session.
+                        if not result[1]:
+                            self._mod_details_results[name] = result
+                        return show_source(result)
+
+                    GLib.idle_add(finished)
+
+                threading.Thread(target=lookup, daemon=True).start()
         dialog.show_all()
-        dialog.run()
+        response = dialog.run()
+        update_enabled = update_button.get_sensitive()
         dialog.destroy()
+        if response == 1:
+            self.delete_mods(names=[name])
+        elif response == 2 and update_enabled:
+            self.install_mod_update(result, on_finished=lambda: self.show_mod_details(name))
+        elif response == 3 and main_copy:
+            self.check_mod_details_updates(name, mod["path"])
+
+    def check_mod_details_updates(self, name, path):
+        if self.busy or self.startup_update_check_running:
+            self.notice("Wait for the current operation or automatic update check to finish.")
+            return
+        mod = self.hub.main_mods().get(name)
+        if not mod or mod["path"] != path:
+            self.notice("Mod updates only check the selected copy when it is in the main FS25 mod folder.")
+            return
+
+        def finished(_):
+            self._render_updates()
+            self.show_mod_details(name)
+
+        self._run(lambda progress: self.modhub.check_mods([copy.deepcopy(mod)], progress, force=True),
+                  finished, f"Checking updates for {mod['title']}…")
 
 
     def name_dialog(self, title, initial="", with_slot=False):
@@ -748,6 +884,7 @@ class Window(Gtk.Window):
             loadout = self.hub.new_loadout(name, self.current["mods"] if clone and self.current else [], slot)
             if clone and self.current:
                 loadout["mod_sources"] = copy.deepcopy(self.current.get("mod_sources", {}))
+                loadout["pinned_mods"] = copy.deepcopy(self.current.get("pinned_mods", {}))
                 if self.current.get("mod_source_folder"):
                     loadout["mod_source_folder"] = self.current["mod_source_folder"]
             if clone and self.current and "dlcs" in self.current:
@@ -823,8 +960,8 @@ class Window(Gtk.Window):
         if collection and names:
             self._save_collection_members(collection, set(collection["mods"]) - set(names))
 
-    def delete_mods(self):
-        names = self.library.highlighted_names()
+    def delete_mods(self, names=None):
+        names = self.library.highlighted_names() if names is None else list(names)
         if not names:
             self.notice("Highlight mod pictures first. Use Ctrl-click or Shift-click to select several mods.")
             return
@@ -1463,7 +1600,10 @@ class Window(Gtk.Window):
             for candidate in result.get("candidates", []):
                 row.pack_start(Gtk.LinkButton.new_with_label(candidate["url"], "Possible GitHub source: " + candidate["repo"]), False, False, 0)
             controls = box(False, 8)
-            if result["can_update"]:
+            pinned_in = self.hub.pinned_loadouts_for_mod(result["name"], main_mods[result["name"]]["path"])
+            if result["can_update"] and pinned_in:
+                row.pack_start(label("Pinned in " + ", ".join(pinned_in) + " · unpin before updating", "muted", True), False, False, 0)
+            elif result["can_update"]:
                 controls.pack_start(button("Download and replace", lambda r=result: self.install_mod_update(r), True), False, False, 0)
             elif result["status"] == "Update available":
                 row.pack_start(label("Unpacked mods can be downloaded from their source page and imported as ZIPs.", "muted", True), False, False, 0)
@@ -1541,7 +1681,7 @@ class Window(Gtk.Window):
             mod = copy.deepcopy(self.hub.main_mods()[name])
             self._run(lambda _: self.modhub.link(mod, url), lambda _: self._updates_finished(), "Verifying the mod update source…")
 
-    def install_mod_update(self, result):
+    def install_mod_update(self, result, on_finished=None):
         if self.startup_update_check_running:
             self.notice("Wait for the automatic update check to finish before installing an update.")
             return
@@ -1561,8 +1701,11 @@ class Window(Gtk.Window):
 
         def finished(updated):
             self.loaded()
-            self.go("Mod updates")
             self.toast(f"Updated {updated['name']} to {updated['version']} · previous ZIP backed up")
+            if on_finished:
+                on_finished()
+            else:
+                self.go("Mod updates")
         self._run(work, finished, "Downloading the mod update…")
 
     def install_all_mod_updates(self):
@@ -1572,9 +1715,15 @@ class Window(Gtk.Window):
         if game_running():
             self.notice("Close FS25 before replacing mods.")
             return
-        updates = [result for result in self.modhub.results(self.hub.main_mods()) if result["can_update"]]
+        main_mods = self.hub.main_mods()
+        available = [result for result in self.modhub.results(main_mods) if result["can_update"]]
+        updates = [result for result in available
+                   if not self.hub.pinned_loadouts_for_mod(result["name"], main_mods[result["name"]]["path"])]
         if not updates:
-            self.notice("No verified updates are ready to install. Check for updates first.")
+            if available:
+                self.notice("All verified updates are pinned in one or more loadouts. Unpin a version before updating it.")
+            else:
+                self.notice("No verified updates are ready to install. Check for updates first.")
             return
         names = [result["local_title"] for result in updates]
         preview = "\n".join(names[:12]) + (f"\n…and {len(names) - 12} more" if len(names) > 12 else "")

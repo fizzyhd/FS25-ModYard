@@ -139,6 +139,27 @@ class CoreTests(unittest.TestCase):
         self.hub.scan()
         self.assertTrue(all("icon" in item for item in self.hub.mods.values()))
 
+    def test_metadata_cache_without_descriptions_is_refreshed_from_zip(self):
+        path = self.library / "FS25_Existing.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("modDesc.xml", '''<modDesc descVersion="105">
+                <title><en>Existing</en></title><version>1.0.0.0</version>
+                <description><en><![CDATA[
+This description comes from the installed ZIP.
+Second line.
+                ]]></en><de>Andere Beschreibung</de></description>
+                </modDesc>''')
+        self.hub.scan()
+        cache = json.loads(self.hub.cache_path.read_text())
+        for item in cache.values():
+            item.pop("description", None)
+        self.hub.cache_path.write_text(json.dumps(cache))
+        self.hub.scan()
+        expected = "This description comes from the installed ZIP.\nSecond line."
+        self.assertEqual(self.hub.mods[path.name]["description"], expected)
+        stored = json.loads(self.hub.cache_path.read_text())
+        self.assertEqual(stored[str(path.resolve())]["description"], expected)
+
     def test_dependency_cycles_resolve_and_map_cannot_be_deselected(self):
         selected, missing = self.hub.dependency_closure(["FS25_New.zip"])
         self.assertEqual(selected, {"FS25_New.zip", "FS25_Dep.zip"})

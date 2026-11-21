@@ -57,9 +57,19 @@ class ModPage(HTMLParser):
         self.cell_depth = 0
         self.cell = ""
         self.heading = None
+        self.description_depth = 0
+        self.description = ""
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        classes = attrs.get("class", "").lower().split()
+        if self.description_depth:
+            if tag not in {"br", "img", "hr", "meta", "link", "input"}:
+                self.description_depth += 1
+        elif any("description" in value for value in classes) or "description" in attrs.get("id", "").lower():
+            self.description_depth = 1
+        if tag == "br" and self.description_depth:
+            self.description += "\n"
         if tag == "div" and "table-cell" in attrs.get("class", "").split() and not self.cell_depth:
             self.cell_depth, self.cell = 1, ""
         elif tag == "div" and self.cell_depth:
@@ -72,10 +82,14 @@ class ModPage(HTMLParser):
     def handle_data(self, data):
         if self.cell_depth:
             self.cell += data
+        if self.description_depth:
+            self.description += data
         if self.heading is not None:
             self.heading += data
 
     def handle_endtag(self, tag):
+        if self.description_depth and tag not in {"br", "img", "hr", "meta", "link", "input"}:
+            self.description_depth -= 1
         if tag == "div" and self.cell_depth:
             self.cell_depth -= 1
             if not self.cell_depth:
@@ -156,11 +170,12 @@ def parse_mod_page(page, mod_id):
                      urllib.parse.unquote(urllib.parse.urlsplit(u).path).endswith("/" + filename)), "")
     if not download or not version_number(fields.get("Version", "")):
         raise HubError("ModHub did not provide a usable version and ZIP download for this mod.")
+    description = "\n".join(line.strip() for line in parsed.description.splitlines() if line.strip())
     return {"id": str(mod_id), "filename": filename, "title": next(iter(parsed.headings), filename),
             "author": fields.get("Author", ""), "version": fields["Version"], "released": fields.get("Released", ""),
             "category": fields.get("Category", "ModHub mod").rsplit(" - ", 1)[-1],
             "category_path": fields.get("Category", "ModHub mod"),
-            "size": fields.get("Size", ""), "download_url": download,
+            "size": fields.get("Size", ""), "description": description, "download_url": download,
             "url": BASE + "mod.php?" + urllib.parse.urlencode({"mod_id": str(mod_id), "title": "fs2025", "lang": "en"}),
             "checked_at": datetime.now(timezone.utc).isoformat()}
 
@@ -238,6 +253,25 @@ class ModHubClient:
             raise HubError("Choose a valid official ModHub page.")
         url = BASE + "mod.php?" + urllib.parse.urlencode({"mod_id": mod_id, "title": "fs2025", "lang": "en"})
         return parse_mod_page(self._fetch(url), mod_id)
+
+    def find_modhub_entry(self, mod, progress=None):
+        """Resolve an installed mod to an exact official ModHub filename, if available."""
+        cached = self.cache["entries"].get(mod["name"], {})
+        if cached.get("id"):
+            try:
+                entry = self.detail(cached["id"])
+                if entry["filename"].casefold() == mod["name"].casefold():
+                    return entry
+            except (HubError, OSError, ValueError):
+                pass
+        entry = self._find_dependency_on_modhub(mod["name"], progress)
+        if entry:
+            self.cache["entries"][mod["name"]] = entry
+            try:
+                write_json(self.cache_path, self.cache)
+            except OSError:
+                pass
+        return entry
 
     def search(self, query="", page=0, progress=None, category=None):
         page = max(0, int(page))
@@ -552,6 +586,9 @@ class ModHubClient:
         entry = self.cache["entries"].get(name, {})
         if not mod or not (entry.get("id") or entry.get("repo")) or not name.lower().endswith(".zip") or not Path(mod["path"]).is_file():
             raise HubError("Check this ZIP mod's update source before updating it.")
+        pinned = hub.pinned_loadouts_for_mod(name, mod["path"])
+        if pinned:
+            raise HubError("This version is pinned in " + ", ".join(pinned) + ". Unpin it before updating.")
         is_github = entry.get("source") == "github"
         entry = self.github.check_repo(mod, entry["repo"], entry, trusted=entry.get("trusted_repo", False)) if is_github else self.detail(entry["id"])
         source_label = "GitHub" if is_github else "ModHub"
@@ -636,6 +673,9 @@ class ModHubClient:
         if not mod or source.name != name or source.suffix.lower() != ".zip":
             raise HubError("Choose a ZIP with the same filename as the installed mod.")
         target = Path(mod["path"]).resolve()
+        pinned = hub.pinned_loadouts_for_mod(name, target)
+        if pinned:
+            raise HubError("This version is pinned in " + ", ".join(pinned) + ". Unpin it before replacing.")
         if not target.is_file():
             raise HubError("Only installed ZIP mods can be replaced by importing a ZIP.")
         original_stamp = file_stamp(target)

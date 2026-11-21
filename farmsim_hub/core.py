@@ -165,7 +165,7 @@ def valid_mod_name(name: str) -> bool:
 def mod_info(path: Path, game_data_dirs=()) -> dict:
     info = {"name": path.name, "path": str(path.resolve()), "title": path.stem,
             "author": "", "version": "", "dependencies": [], "kind": "Equipment",
-            "size": 0, "error": "", "icon": "", "categories": ["Equipment"], "category_terms": []}
+            "size": 0, "description": "", "error": "", "icon": "", "categories": ["Equipment"], "category_terms": []}
     try:
         file_stat = path.stat()
         info["size"] = file_stat.st_size if path.is_file() else 0
@@ -189,6 +189,11 @@ def mod_info(path: Path, game_data_dirs=()) -> dict:
             info["title"] = ((title.findtext("en") or "").strip() or (title.text or "").strip() or
                              next((c.text.strip() for c in title if c.text and c.text.strip()), "") or path.stem)
         info["author"] = (root.findtext("author") or "").strip()
+        description = root.find("description")
+        if description is not None:
+            localized = next(("".join(node.itertext()).strip() for node in description
+                              if node.tag.lower() in {"en", "english"} and "".join(node.itertext()).strip()), "")
+            info["description"] = localized or "".join(description.itertext()).strip()
         info["version"] = (root.findtext("version") or "").strip()
         info["icon"] = (root.findtext("iconFilename") or "").strip()
         info["dependencies"] = [d.text.strip().removesuffix(".zip")
@@ -556,7 +561,8 @@ class Hub:
                 if path.is_dir():
                     fp.append((path / "modDesc.xml").stat().st_mtime_ns)
                 info = cache.get(key)
-                if info is None or "icon" not in info or info.get("fingerprint") != fp or not category_cache_valid(info):
+                if (info is None or "icon" not in info or "description" not in info or
+                        info.get("fingerprint") != fp or not category_cache_valid(info)):
                     info = mod_info(path, game_data)
                 cache[key] = info
                 variants.setdefault(path.name, []).append(info)
@@ -640,6 +646,49 @@ class Hub:
         else:
             sources[name] = path
         self.save_config()
+
+    def pinned_mod_for_loadout(self, loadout, name):
+        """Return this loadout's pin when it matches the currently selected copy."""
+        if not loadout:
+            return None
+        pin = loadout.get("pinned_mods", {}).get(name)
+        selected = self.mod_for_loadout(name, loadout)
+        if not pin or not selected:
+            return None
+        if Path(pin.get("path", "")).expanduser().resolve() != Path(selected["path"]).expanduser().resolve():
+            return None
+        return pin
+
+    def set_mod_pinned(self, loadout, name, pinned):
+        """Pin or unpin the currently selected source copy for a loadout."""
+        if name not in loadout.get("mods", []):
+            raise HubError("Add this mod to the loadout before pinning its version.")
+        selected = self.mod_for_loadout(name, loadout)
+        if not selected or not Path(selected["path"]).is_file():
+            raise HubError("This mod copy is no longer available. Rescan the library and try again.")
+        pins = loadout.setdefault("pinned_mods", {})
+        if pinned:
+            pins[name] = {"path": str(Path(selected["path"]).resolve()),
+                          "version": selected.get("version", "")}
+        else:
+            pins.pop(name, None)
+        self.save_config()
+
+    def pinned_loadouts_for_mod(self, name, path):
+        """List loadouts pinning this exact source copy while they use it."""
+        target = Path(path).expanduser().resolve()
+        pinned = []
+        for loadout in self.config.get("loadouts", []):
+            if name not in loadout.get("mods", []):
+                continue
+            pin = loadout.get("pinned_mods", {}).get(name)
+            selected = self.mod_for_loadout(name, loadout)
+            if not pin or not selected:
+                continue
+            if (Path(pin.get("path", "")).expanduser().resolve() == target and
+                    Path(selected["path"]).expanduser().resolve() == target):
+                pinned.append(loadout.get("name", "Unnamed loadout"))
+        return pinned
 
     def seed_loadouts(self):
         with self.lock:
